@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory(prefix='personal-site-acceptance-') as temp:
         cover_payload={'image':'data:image/jpeg;base64,'+base64.b64encode(cover_bytes).decode()}
         for kind in server.KINDS:
             ensure(request('/api/'+kind)[1]==[],'initial empty kind')
-            record={'title':'acceptance-only','url':origin,'category':'动漫','rating':None,'body':'# temporary note'}
+            record={'published':False,'title':'acceptance-only','url':origin,'category':'动漫','rating':None,'body':'# temporary note'}
             status,created=request('/api/'+kind,'POST',record);ensure(status==201,'create '+kind)
             ident=created['id'];record['title']='edited-only'
             if kind in ('posts','notes'):record['body']='中😀'*25000
@@ -116,7 +116,7 @@ with tempfile.TemporaryDirectory(prefix='personal-site-acceptance-') as temp:
                 ensure(request(f'/covers/{ident}.jpg')[0]==404,'cover removed with record '+kind)
             ensure(request('/api/'+kind)[1]==[],'empty after delete')
         for category in server.CATEGORIES:
-            ensure(request('/api/works','POST',{'title':'temporary '+category,'category':category,'rating':None})[0]==201,'seven categories')
+            ensure(request('/api/works','POST',{'title':'temporary '+category,'category':category,'rating':None,'published':False})[0]==201,'seven categories')
         ensure(request('/api/works','POST',{'title':'bad','category':'电影','rating':11})[0]==400,'rating bounds')
         ensure(request('/api/services')[0]==404,'removed services API')
         profile={'name':'Acceptance only','bio':'Temporary profile'}
@@ -162,7 +162,7 @@ with tempfile.TemporaryDirectory(prefix='personal-site-acceptance-') as temp:
 
         friend_ids=[]
         for title,order in [('后显示的友链',20),('先显示的友链',-5)]:
-            status,friend=request('/api/friends','POST',{'title':title,'url':origin,'notes':'仅用于临时验收','order':order})
+            status,friend=request('/api/friends','POST',{'title':title,'url':origin,'notes':'仅用于临时验收','order':order,'published':False})
             ensure(status==201,'create ordered friend')
             friend_ids.append(friend['id'])
         friend_avatar_url=upload_media('friend',friend_ids[1],'avatar',cover_payload)

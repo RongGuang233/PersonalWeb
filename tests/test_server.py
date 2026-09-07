@@ -100,7 +100,7 @@ class Integration(unittest.TestCase):
         return json.loads(body)
 
     def record(self, kind, **values):
-        data = {'title': 'private-marker', 'url': self.origin, 'body': '# 私人记录', 'category': '动漫', 'rating': ''}
+        data = {'title': 'private-marker', 'url': self.origin, 'body': '# 私人记录', 'category': '动漫', 'rating': '', 'published': False}
         data.update(values)
         status, body, _ = self.req('/api/' + kind, 'POST', data)
         self.assertEqual(status, 201)
@@ -175,7 +175,24 @@ class Integration(unittest.TestCase):
         self.login()
         rows = json.loads(self.req('/api/works')[1])
         self.assertEqual(len(rows), 7)
-        self.assertTrue(all(row['rating'] is None and not row['published'] for row in rows))
+        self.assertTrue(all(row['rating'] is None and row['published'] for row in rows))
+
+    def test_new_records_default_public_and_explicit_private_stays_private(self):
+        self.login()
+        for kind in server.KINDS:
+            with self.subTest(kind=kind):
+                data={'title':'new default', 'url':self.origin, 'category':'游戏', 'rating':8}
+                status,body,_=self.req('/api/'+kind,'POST',data)
+                self.assertEqual(status,201)
+                ident=json.loads(body)['id']
+                self.assertEqual([r['id'] for r in self.public()[kind]],[ident])
+                data['published']=False
+                status,body,_=self.req('/api/'+kind,'POST',data)
+                self.assertEqual(status,201)
+                private_id=json.loads(body)['id']
+                del data['published']
+                self.assertEqual(self.req(f'/api/{kind}/{private_id}','PUT',data)[0],200)
+                self.assertEqual([r['id'] for r in self.public()[kind]],[ident])
 
     def test_public_content_is_explicit_and_publish_state_survives_updates(self):
         public = self.public()

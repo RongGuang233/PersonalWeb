@@ -248,11 +248,12 @@ function editRecord(kind, record = {}) {
   if (kind === 'posts') fields += area('summary', '摘要（可留空，默认取正文开头）', record.summary, 3, 4000);
   if (kind === 'works') fields += field('progress', '进度', record.progress) + field('rating', '评分（0–10，可留空）', record.rating, 'number');
   if (!['posts', 'notes'].includes(kind)) fields += area('notes', kind === 'works' ? '短评' : kind === 'friends' ? '站点简介' : '备注', record.notes, 4, 4000);
-  fields += `<label class="checkbox-label"><input type="checkbox" name="published" ${record.published ? 'checked' : ''}><span>公开到个人主页<small>勾选后，所有访客都可以看到这条内容。</small></span></label>`;
+  fields += `<label class="checkbox-label"><input type="checkbox" name="is_private" ${(record.id ? record.published !== true : record.published === false) ? 'checked' : ''}><span>仅自己可见<small>勾选后设为私密，不勾选则公开到个人主页。</small></span></label>`;
   fields = titleField + (kind === 'works' ? `<label>分类<select name="category">${categories.map(c => `<option ${c === record.category ? 'selected' : ''}>${c}</option>`).join('')}</select></label>` : '') + fields;
   showForm((record.id ? '编辑' : '新增') + kinds[kind].name, fields, async data => {
     if (coverProcessing) throw new Error('正在处理封面，请稍候再保存。');
-    data.published = data.published === 'on';
+    data.published = data.is_private !== 'on';
+    delete data.is_private;
     if (kind === 'friends') data.order = Number(data.order);
     if (supportsCover) { $('#choose-cover').disabled = true; $('#remove-cover').disabled = true; }
     try {
@@ -278,8 +279,8 @@ function editRecord(kind, record = {}) {
       if (supportsCover && $('#cover-editor')) { $('#choose-cover').disabled = false; $('#remove-cover').disabled = false; }
     }
   }, '保存', {writing, watch:true, extraChanges:() => pendingCover !== undefined || pendingFriendAvatar !== undefined});
-  const visibility = $('#fields input[name=published]');
-  const updateVisibility = () => { $('#save-hint').textContent = visibility.checked ? '保存后公开，所有访客可见' : '保存后仅自己可见'; };
+  const visibility = $('#fields input[name=is_private]');
+  const updateVisibility = () => { $('#save-hint').textContent = visibility.checked ? '保存后仅自己可见' : '保存后公开，所有访客可见'; };
   visibility.onchange = updateVisibility; updateVisibility();
   if (kind === 'friends') {
     $('#choose-friend-avatar').onclick = () => $('#friend-avatar-file').click();

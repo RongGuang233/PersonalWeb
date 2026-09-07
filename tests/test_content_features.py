@@ -55,7 +55,7 @@ class ContentFeatures(unittest.TestCase):
         self.assertEqual(draft['body'], '  unfinished\n\n')
         self.assertEqual(draft['title'], '')
         self.assertIsNone(draft['record_id'])
-        self.assertFalse(draft['published'])
+        self.assertTrue(draft['published'])
         self.draft('new', kind='posts', title='', body='第二次内容\n')
         self.assertEqual(len(json.loads(self.req('/api/drafts')[1])), 1)
         self.assertEqual(self.public()['posts'], [])
@@ -76,6 +76,19 @@ class ContentFeatures(unittest.TestCase):
         for flag in ('published', 'featured', 'pinned'):
             self.assertEqual(self.req('/api/drafts/bad', 'PUT', {'kind': 'notes', flag: 'true'})[0], 400)
         self.assertEqual(self.req('/api/drafts/missing', 'PUT', {'kind': 'posts', 'record_id': 9999})[0], 404)
+
+    def test_new_note_draft_stays_hidden_until_commit_and_private_choice_persists(self):
+        self.login()
+        draft=self.draft('new-note',kind='notes',title='默认公开笔记',body='正文')
+        self.assertTrue(draft['published'])
+        self.assertEqual(self.public()['notes'],[])
+        ident=self.commit('new-note')['id']
+        self.assertEqual([r['id'] for r in self.public()['notes']],[ident])
+        self.draft('private-note',kind='notes',title='私密笔记',published=False)
+        updated=self.draft('private-note',body='自动保存')
+        self.assertFalse(updated['published'])
+        self.commit('private-note')
+        self.assertEqual([r['id'] for r in self.public()['notes']],[ident])
 
     def test_published_edit_keeps_original_content_and_cover_until_commit(self):
         self.login()

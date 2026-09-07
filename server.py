@@ -74,7 +74,7 @@ def validate(kind, data, previous=None, draft=False):
             d['rating']=float(d['rating'])
             if not 0<=d['rating']<=10: raise ValueError('评分范围为 0–10')
     # A partial update must not silently publish or unpublish existing content.
-    d['published'] = data.get('published',(previous or {}).get('published') is True)
+    d['published'] = data.get('published',True if previous is None else previous.get('published') is True)
     if not isinstance(d['published'],bool): raise ValueError('公开状态必须为 true 或 false')
     if kind=='posts':
         for field in ('featured','pinned'):
@@ -169,8 +169,8 @@ def save_draft(c,key,data):
     if old and (kind!=old['kind'] or record_id!=old['record_id']): raise ValueError('草稿不能更换所属内容')
     record=c.execute('SELECT * FROM records WHERE id=? AND kind=?',(record_id,kind)).fetchone() if record_id is not None else None
     if record_id is not None and record is None: return None
-    previous=json.loads(old['data']) if old else json.loads(record['data']) if record else {}
-    merged=dict(previous,**data)
+    previous=json.loads(old['data']) if old else json.loads(record['data']) if record else None
+    merged=dict(previous or {},**data)
     d=validate(kind,merged,previous,draft=True)
     # Boolean editor flags are validated even if they do not apply to notes.
     for flag in ('featured','pinned'):
@@ -200,7 +200,8 @@ def check_content_media(c,data,record_id=None,draft_key=None):
         if not (owned_record or owned_draft): raise ValueError('正文图片不属于这条内容')
 
 def commit_draft(c,row):
-    d=validate(row['kind'],json.loads(row['data']))
+    stored=json.loads(row['data'])
+    d=validate(row['kind'],stored,previous=stored)
     ident=row['record_id']
     check_content_media(c,d,ident,row['key'])
     if ident is None:
