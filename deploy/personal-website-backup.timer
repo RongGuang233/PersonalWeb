@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily personal website backup at 04:30 Shanghai time
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 Asia/Shanghai
+Persistent=true
+Unit=personal-website-backup.service
+
+[Install]
+WantedBy=timers.target

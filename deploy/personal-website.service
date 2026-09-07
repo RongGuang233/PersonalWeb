@@ -1,0 +1,16 @@
+[Unit]
+Description=Personal private website
+After=network.target
+[Service]
+Type=simple
+User=personal-site
+Group=personal-site
+WorkingDirectory=/opt/projects/personal-website
+Environment=SITE_DB=/var/lib/personal-website/site.sqlite3
+EnvironmentFile=/etc/personal-website.env
+ExecStart=/usr/bin/python3 /opt/projects/personal-website/server.py --port 3080
+Restart=on-failure
+RestartSec=3
+UMask=0077
+[Install]
+WantedBy=multi-user.target

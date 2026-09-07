@@ -1,0 +1,15 @@
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const target = path.resolve(__dirname, '../public');
+const markedRoot = path.dirname(require.resolve('marked/package.json'));
+const katexDist = path.dirname(require.resolve('katex'));
+const extensionLib = path.dirname(require.resolve('marked-katex-extension'));
+fs.copyFileSync(path.join(markedRoot, 'lib/marked.umd.js'), path.join(target, 'marked.umd.js'));
+fs.copyFileSync(path.join(markedRoot, 'LICENSE'), path.join(target, 'marked-LICENSE.txt'));
+fs.mkdirSync(path.join(target, 'katex'), {recursive: true});
+for (const file of ['katex.min.js', 'katex.min.css']) fs.copyFileSync(path.join(katexDist, file), path.join(target, 'katex', file));
+fs.cpSync(path.join(katexDist, 'fonts'), path.join(target, 'katex/fonts'), {recursive: true});
+fs.copyFileSync(path.join(katexDist, '../LICENSE'), path.join(target, 'katex/LICENSE'));
+fs.copyFileSync(path.join(extensionLib, 'index.umd.js'), path.join(target, 'marked-katex.umd.js'));
+fs.copyFileSync(path.join(extensionLib, '../LICENSE'), path.join(target, 'marked-katex-LICENSE.txt'));

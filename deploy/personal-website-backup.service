@@ -1,0 +1,12 @@
+[Unit]
+Description=Back up personal website SQLite database
+
+[Service]
+Type=oneshot
+User=personal-site
+Group=personal-site
+WorkingDirectory=/opt/projects/personal-website
+Environment=SITE_DB=/var/lib/personal-website/site.sqlite3
+EnvironmentFile=/etc/personal-website.env
+ExecStart=/usr/bin/python3 /opt/projects/personal-website/backup.py --dest /var/backups/personal-website --keep 7
+UMask=0077

@@ -1,0 +1,11 @@
+data/
+dist/
+artifacts/
+__pycache__/
+*.pyc
+.env
+.env.*
+node_modules/
+.DS_Store
+*.sqlite*
+*.db
