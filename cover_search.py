@@ -1,4 +1,4 @@
-"""On-demand covers from Douban and Steam public website search endpoints.
+"""On-demand covers from Bangumi, Douban and Steam public search endpoints.
 
 Search is intentionally limited to these catalogues. Images are only returned
 for browser preview/normalization; this module never writes uploaded images.
@@ -13,7 +13,8 @@ import urllib.parse
 import urllib.request
 
 
-CATEGORIES = ('动漫', '漫画', '游戏', '小说', '电影', '电视剧', '出版书籍')
+CATEGORIES = ('动画', '漫画', '游戏', '小说', '电影', '电视剧', '出版书籍')
+ANIME_CATEGORIES = ('动画', '动漫')
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 TIMEOUT = 12
 USER_AGENT = 'personal-website-cover-search/1.0'
@@ -38,6 +39,9 @@ def _validate_image_url(url):
     elif parsed.hostname == 'shared.akamai.steamstatic.com':
         valid = valid and re.fullmatch(r'(?:t=[0-9]+)?', parsed.query) and re.fullmatch(
             r'/store_item_assets/steam/apps/[0-9]+/(?:[0-9a-f]{40}/)?(?:header|capsule_[0-9]+x[0-9]+)(?:_[a-z]+)?\.(?:jpg|png)', parsed.path)
+    elif parsed.hostname == 'lain.bgm.tv':
+        valid = valid and not parsed.query and re.fullmatch(
+            r'/pic/cover/[scmlg]/[0-9a-f]{2}/[0-9a-f]{2}/[0-9]+_[A-Za-z0-9]+\.(?:jpg|jpeg|webp|png)', parsed.path)
     else:
         valid = False
     if not valid:
@@ -89,6 +93,8 @@ def _json_request(url):
     host = urllib.parse.urlsplit(url).hostname
     if host in ('movie.douban.com', 'book.douban.com'):
         headers['Referer'] = f'https://{host}/'
+    elif host in ('api.bgm.tv', 'lain.bgm.tv'):
+        headers['Referer'] = 'https://bgm.tv/'
     request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.build_opener(_NoRedirects()).open(request, timeout=TIMEOUT) as response:
@@ -147,6 +153,39 @@ def _douban(query, category):
     return _narrow_titles(query, results)
 
 
+def _bangumi(query):
+    """Anime covers from Bangumi subject search; Chinese titles work well."""
+    data = _json_request('https://api.bgm.tv/search/subject/' + urllib.parse.quote(query) + '?type=2&responseGroup=small')
+    if not isinstance(data, dict) or not isinstance(data.get('list'), list):
+        raise CoverSourceError('Bangumi 返回了无法识别的搜索结果')
+    results = []
+    for item in data['list']:
+        if not isinstance(item, dict) or item.get('type') != 2:
+            continue
+        ident, title = item.get('id'), item.get('name_cn') or item.get('name')
+        if not isinstance(ident, int) or ident <= 0 or not isinstance(title, str) or not title.strip():
+            continue
+        images = item.get('images') if isinstance(item.get('images'), dict) else {}
+        image_url = images.get('large') or images.get('common') or images.get('medium') or images.get('small')
+        if isinstance(image_url, str) and image_url.startswith('http://'):
+            image_url = 'https://' + image_url[len('http://'):]
+        try:
+            _validate_image_url(image_url)
+        except ValueError:
+            continue
+        air_date = item.get('air_date') if isinstance(item.get('air_date'), str) else ''
+        name = item.get('name') if isinstance(item.get('name'), str) else ''
+        parts = ['动画']
+        if air_date:
+            parts.append(air_date[:4] if len(air_date) >= 4 else air_date)
+        if name and name.strip() and name.strip() != title.strip():
+            parts.append(name.strip())
+        results.append({'title': title, 'subtitle': ' · '.join(parts),
+                        'image_url': image_url, 'source': 'Bangumi',
+                        'source_url': f'https://bgm.tv/subject/{ident}/'})
+    return _narrow_titles(query, results)
+
+
 def _steam(query):
     params = urllib.parse.urlencode({'term': query, 'l': 'schinese', 'cc': 'cn'})
     data = _json_request('https://store.steampowered.com/api/storesearch/?' + params)
@@ -199,10 +238,21 @@ def search_covers(query, category):
         raise ValueError('请选择有效的作品分类')
     query = query.strip()
     try:
-        candidates = _steam(query) if category == '游戏' else _douban(query, category)
+        if category == '游戏':
+            candidates = _steam(query)
+        elif category in ANIME_CATEGORIES:
+            candidates = _bangumi(query)
+        else:
+            candidates = _douban(query, category)
     except CoverSourceError:
-        name = 'Steam' if category == '游戏' else '豆瓣'
-        return {'results': [], 'message': name + ' 暂时无法访问，请稍后重试或手动上传封面。'}
+        if category in ANIME_CATEGORIES:
+            try:
+                candidates = _douban(query, category)
+            except CoverSourceError:
+                return {'results': [], 'message': 'Bangumi 与豆瓣暂时无法访问，请稍后重试或手动上传封面。'}
+        else:
+            name = 'Steam' if category == '游戏' else '豆瓣'
+            return {'results': [], 'message': name + ' 暂时无法访问，请稍后重试或手动上传封面。'}
     results, seen = [], set()
     for item in candidates:
         if item['source_url'] not in seen:
@@ -215,7 +265,9 @@ def search_covers(query, category):
     message = '请核对名称、年份和版本后点选。'
     if results and results[0]['source'] == '豆瓣读书':
         message = '图书候选：请核对作者和版本。'
-    elif results and category == '动漫' and results[0]['source'] == '豆瓣电影':
+    elif results and category in ANIME_CATEGORIES and results[0]['source'] == 'Bangumi':
+        message = '动画候选：请核对季度与版本。'
+    elif results and category in ANIME_CATEGORIES and results[0]['source'] == '豆瓣电影':
         message = '影视候选：请确认选择动画版。'
     return {'results': results[:8], 'message': message}
 
@@ -227,6 +279,8 @@ def fetch_cover_image(url):
     parsed = urllib.parse.urlsplit(url)
     if re.fullmatch(r'img[0-9]\.doubanio\.com', parsed.hostname or ''):
         headers['Referer'] = 'https://book.douban.com/' if parsed.path.startswith('/view/subject/') else 'https://movie.douban.com/'
+    elif parsed.hostname == 'lain.bgm.tv':
+        headers['Referer'] = 'https://bgm.tv/'
     request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.build_opener(_ImageRedirects()).open(request, timeout=TIMEOUT) as response:

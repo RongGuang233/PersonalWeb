@@ -4,17 +4,24 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
-  <meta name="theme-color" content="#f1f5f9">
+  <meta name="theme-color" content="#f1f5f9" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#181e28" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <title>RongGuang233 · 个人小站</title>
+  <script src="/theme-init.js"></script>
   <link rel="stylesheet" href="/katex/katex.min.css">
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/image-editor.css">
+  <link rel="stylesheet" href="/portal.css">
+  <link rel="stylesheet" href="/reading-navigation.css">
   <script src="/marked.umd.js" defer></script>
   <script src="/katex/katex.min.js" defer></script>
   <script src="/marked-katex.umd.js" defer></script>
   <script src="/markdown.js" defer></script>
   <script src="/image-editor.js" defer></script>
   <script src="/writing-editor.js" defer></script>
+  <script src="/reading-navigation.js" defer></script>
+  <script src="/work-browser.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -25,15 +32,20 @@
       <a href="#home" data-nav="home">首页</a>
       <a href="#posts" data-nav="posts">博客</a>
       <a href="#notes" data-nav="notes">笔记</a>
+      <a href="#projects" data-nav="projects">项目</a>
+      <a href="#works" data-nav="works">作品记录</a>
       <a href="#friends" data-nav="friends">友链</a>
+      <a href="#bookmarks" data-nav="bookmarks">收藏</a>
+      <a href="#about" data-nav="about">关于我</a>
     </nav>
     <div class="header-actions">
       <button class="search-toggle" id="search-toggle" aria-label="搜索公开内容"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg> <span>搜索</span></button>
+      <span id="header-owner"></span>
       <button id="theme-toggle" aria-label="切换深色外观" title="切换深色外观">☾</button>
     </div>
   </header>
   <main id="main" tabindex="-1"><p class="loading">正在读取小站…</p></main>
-  <footer class="site-footer"><span id="footer-name">RongGuang233 的个人小站</span><span>博客 · 笔记 · 作品 · 友链</span></footer>
+  <footer class="site-footer"><span id="footer-name"><svg class="beian-icon" viewBox="0 0 40 40" fill="none" aria-hidden="true"><path d="M8 29a12 12 0 0 1 24 0M20 3v7M4 13l5 4M36 13l-5 4M3 29h34M12 34h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>RongGuang233 © 2026</span><span class="beian"><a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer"><svg class="beian-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6"/><path d="M8 12h8M12 8v8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>黔ICP备2026017181号-1</a><a href="https://beian.mps.gov.cn/" target="_blank" rel="noreferrer"><svg class="beian-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3l8 3v6c0 5-3.5 8.5-8 9-4.5-.5-8-4-8-9V6l8-3z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>贵公网安备52010202004633号</a></span></footer>
   <dialog id="dialog" aria-labelledby="dialog-title">
     <form id="form">
       <div class="dialog-head"><h2 id="dialog-title"></h2><button type="button" id="close" aria-label="关闭">×</button></div>

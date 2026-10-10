@@ -100,7 +100,7 @@ class Integration(unittest.TestCase):
         return json.loads(body)
 
     def record(self, kind, **values):
-        data = {'title': 'private-marker', 'url': self.origin, 'body': '# 私人记录', 'category': '动漫', 'rating': '', 'published': False}
+        data = {'title': 'private-marker', 'url': self.origin, 'body': '# 私人记录', 'category': '动画', 'rating': '', 'published': False}
         data.update(values)
         status, body, _ = self.req('/api/' + kind, 'POST', data)
         self.assertEqual(status, 201)
@@ -125,6 +125,105 @@ class Integration(unittest.TestCase):
         with server.connect() as connection:
             connection.execute('UPDATE sessions SET expires=?', (time.time() - 1,))
         self.assertEqual(self.req('/api/session')[0], 401)
+
+    def test_additional_editor_account_can_login_and_edit(self):
+        server.add_account('friend', 'friend-editor-password')
+        friend = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.assertEqual(self.req('/api/login', 'POST', {'username': 'friend', 'password': 'wrong-editor-password'}, client=friend)[0], 401)
+        self.assertEqual(self.req('/api/login', 'POST', {'username': 'friend', 'password': 'friend-editor-password'}, client=friend)[0], 200)
+        self.assertEqual(self.req('/private', client=friend)[0], 200)
+        status, _, _ = self.req('/api/posts', 'POST', {'title': 'friend 的文章', 'body': 'second account', 'summary': '', 'tags': ''}, client=friend)
+        self.assertEqual(status, 201)
+        self.login()
+        with self.assertRaises(ValueError):
+            server.set_account('friend', 'collision-password-12')
+        with self.assertRaises(ValueError):
+            server.add_account('friend', 'collision-password-12')
+        with self.assertRaises(ValueError):
+            server.add_account('new-editor', 'short')
+
+    def test_add_account_requires_primary_account_first(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(server, 'DB', Path(temp) / 'fresh.sqlite3'):
+            server.init()
+            with self.assertRaises(ValueError):
+                server.add_account('friend', 'friend-editor-password')
+            server.set_account('owner', 'owner-password-123')
+            server.add_account('friend', 'friend-editor-password')
+            with server.connect() as connection:
+                rows = [tuple(row) for row in connection.execute('SELECT id, username FROM account ORDER BY id')]
+            self.assertEqual(rows, [(1, 'owner'), (2, 'friend')])
+
+    def test_note_tags_are_optional_and_round_trip_through_public_api(self):
+        self.login()
+        status, body, _ = self.req('/api/notes', 'POST', {'title': '带主题的笔记', 'body': '正文', 'tags': '数学, 阅读', 'category': '高中数学', 'published': True})
+        self.assertEqual(status, 201)
+        ident = json.loads(body)['id']
+        public = self.public()
+        row = next(item for item in public['notes'] if item['id'] == ident)
+        self.assertEqual(row['tags'], '数学, 阅读')
+        self.assertEqual(row['category'], '高中数学')
+        status, body, _ = self.req(f'/api/notes/{ident}', 'PUT', {'title': '带主题的笔记', 'body': '更新', 'published': True})
+        self.assertEqual(status, 200)
+        row = next(item for item in self.public()['notes'] if item['id'] == ident)
+        self.assertEqual(row['tags'], '')
+        self.assertEqual(row['category'], '')
+
+    def test_note_category_reorder_persists_without_touching_updated_time(self):
+        self.login()
+        ids=[]
+        for title in ('第一章','第二章','第三章'):
+            status, body, _ = self.req('/api/notes', 'POST', {'title': title, 'body': title, 'category': '普通物理', 'published': True})
+            self.assertEqual(status, 201)
+            ids.append(json.loads(body)['id'])
+        before={row['id']:row['updated'] for row in json.loads(self.req('/api/notes')[1])}
+        status, body, _ = self.req('/api/notes/reorder', 'POST', {'category':'普通物理','ids':list(reversed(ids))})
+        self.assertEqual(status, 200)
+        rows=json.loads(self.req('/api/notes')[1])
+        self.assertEqual({row['id']:row['order'] for row in rows if row['id'] in ids}, {ids[0]:3,ids[1]:2,ids[2]:1})
+        self.assertEqual({row['id']:row['updated'] for row in rows if row['id'] in ids}, before)
+        self.assertEqual(self.req('/api/notes/reorder', 'POST', {'category':'普通物理','ids':[ids[0], ids[0]]})[0], 400)
+        self.assertEqual(self.req('/api/notes/reorder', 'POST', {'category':'错误分类','ids':ids})[0], 400)
+        self.assertEqual(self.req('/api/notes/reorder', 'POST', {'category':'普通物理','ids':ids[:1]})[0], 400)
+        # A draft saved before a reorder must not restore the old chapter position.
+        self.assertEqual(self.req('/api/drafts/order-test','PUT',{'kind':'notes','record_id':ids[0],'title':'改稿','category':'普通物理'})[0],200)
+        self.assertEqual(self.req('/api/notes/reorder','POST',{'category':'普通物理','ids':ids})[0],200)
+        self.assertEqual(self.req('/api/drafts/order-test/commit','POST',{})[0],200)
+        row=next(row for row in self.public()['notes'] if row['id']==ids[0])
+        self.assertEqual(row['order'],1)
+        self.assertEqual(self.req(f'/api/notes/{ids[0]}','PUT',{'title':'改分类','category':'数学'})[0],200)
+        row=next(row for row in self.public()['notes'] if row['id']==ids[0])
+        self.assertEqual(row['order'],0)
+
+    def test_note_category_order_round_trip_and_new_categories_append(self):
+        self.assertEqual(self.req('/api/notes/categories/order')[0], 401)
+        self.assertEqual(self.req('/api/notes/categories/order', 'POST', {'categories': []})[0], 401)
+        self.login()
+        for category in ('代数', '几何', '分析'):
+            status, _, _ = self.req('/api/notes', 'POST', {
+                'title': category, 'body': category, 'category': category, 'published': True,
+            })
+            self.assertEqual(status, 201)
+        status, body, _ = self.req('/api/notes/categories/order')
+        self.assertEqual((status, json.loads(body)), (200, {'categories': ['代数', '几何', '分析']}))
+        requested = ['几何', '代数', '分析']
+        status, body, _ = self.req('/api/notes/categories/order', 'POST', {'categories': requested})
+        self.assertEqual((status, json.loads(body)), (200, {'categories': requested}))
+        self.assertEqual(self.req('/api/notes', 'POST', {
+            'title': '私密分类', 'body': '私密分类', 'category': '私密分类', 'published': False,
+        })[0], 201)
+        self.assertEqual(self.public()['note_category_order'], requested)
+        self.assertEqual(json.loads(self.req('/api/notes/categories/order')[1])['categories'], requested + ['私密分类'])
+        self.assertEqual(self.req('/api/notes/categories/order', 'POST', {'categories': requested[:2]})[0], 400)
+        self.assertEqual(self.req('/api/notes/categories/order', 'POST', {'categories': ['几何', '几何', '分析']})[0], 400)
+        self.assertEqual(self.req('/api/notes', 'POST', {
+            'title': '新分类', 'body': '新分类', 'category': '物理', 'published': True,
+        })[0], 201)
+        self.assertEqual(self.public()['note_category_order'], requested + ['物理'])
+        self.assertEqual(json.loads(self.req('/api/notes/categories/order')[1])['categories'], ['几何', '代数', '分析', '物理', '私密分类'])
+        self.restart()
+        self.login()
+        self.assertEqual(json.loads(self.req('/api/notes/categories/order')[1])['categories'], ['几何', '代数', '分析', '物理', '私密分类'])
+
 
     def test_cover_search_requires_login_and_keeps_records_unchanged(self):
         paths=['/api/cover-search?q=test&category=game', '/api/cover-search/image?url=test']
@@ -174,7 +273,7 @@ class Integration(unittest.TestCase):
         self.restart()
         self.login()
         rows = json.loads(self.req('/api/works')[1])
-        self.assertEqual(len(rows), 7)
+        self.assertEqual(len(rows), len(server.CATEGORIES))
         self.assertTrue(all(row['rating'] is None and row['published'] for row in rows))
 
     def test_new_records_default_public_and_explicit_private_stays_private(self):
@@ -196,8 +295,8 @@ class Integration(unittest.TestCase):
 
     def test_public_content_is_explicit_and_publish_state_survives_updates(self):
         public = self.public()
-        self.assertEqual(set(public), {'profile', *server.KINDS})
-        self.assertEqual(public['profile'], {'name': server.DEFAULT_NAME, 'bio': server.DEFAULT_BIO, 'avatar_url': None, 'background_url': None})
+        self.assertEqual(set(public), {'profile', 'note_category_order', 'note_image_sizes', 'hidden_work_categories', *server.KINDS})
+        self.assertEqual(public['profile'], {'name': server.DEFAULT_NAME, 'bio': server.DEFAULT_BIO, 'about': '', 'experience': server.DEFAULT_EXPERIENCE, 'students': [], 'avatar_url': None, 'background_url': None})
         self.assertTrue(all(public[kind] == [] for kind in server.KINDS))
         self.login()
         for kind in server.KINDS:
@@ -264,10 +363,10 @@ class Integration(unittest.TestCase):
                 (f'/api/{kind}/{ident}', 'DELETE', 65536),
                 ('/api/works', 'POST', 65536),
                 ('/api/bookmarks', 'POST', 65536),
-                ('/api/profile', 'PUT', 65536),
+                ('/api/profile', 'PUT', 1024 * 1024),
             ):
                 with self.subTest(path=path, method=method):
-                    connection = http.client.HTTPConnection('127.0.0.1', self.http.server_port)
+                    connection = http.client.HTTPConnection('127.0.0.1', self.http.server_port, timeout=5)
                     try:
                         connection.putrequest(method, path)
                         connection.putheader('Origin', self.origin)
@@ -308,7 +407,7 @@ class Integration(unittest.TestCase):
         original = png()
         status, body, _ = self.req('/api/avatar', 'POST', image_payload(original))
         self.assertEqual(status, 200)
-        expected = dict(profile, avatar_url='/avatar.png', background_url=None)
+        expected = dict(profile, about='', experience=server.DEFAULT_EXPERIENCE, students=[], avatar_url='/avatar.png', background_url=None)
         self.assertEqual(json.loads(body), expected)
         status, body, headers = self.req('/avatar.png', client=self.anonymous)
         self.assertEqual((status, body, headers['Content-Type'], headers['Cache-Control']), (200, original, 'image/png', 'no-store'))
@@ -328,7 +427,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.req('/api/avatar', 'DELETE', {})[0], 200)
         self.restart()
         self.assertEqual(self.req('/avatar.png', client=self.anonymous)[0], 404)
-        self.assertEqual(self.public()['profile'], dict(profile, bio='新的简介', avatar_url=None, background_url=None))
+        self.assertEqual(self.public()['profile'], dict(profile, bio='新的简介', about='', experience=server.DEFAULT_EXPERIENCE, students=[], avatar_url=None, background_url=None))
 
     def test_invalid_avatar_and_profile_leave_previous_values_intact(self):
         self.login()
@@ -357,7 +456,7 @@ class Integration(unittest.TestCase):
         for invalid in ({'name': ''}, {'name': 'x' * 81}, {'bio': 'x' * 1001}, {'bio': []}):
             self.assertEqual(self.req('/api/profile', 'PUT', invalid)[0], 400)
         self.assertEqual(self.req('/api/profile', 'PUT', [1])[0], 400)
-        self.assertEqual(self.public()['profile'], {'name': server.DEFAULT_NAME, 'bio': server.DEFAULT_BIO, 'avatar_url': '/avatar.png', 'background_url': None})
+        self.assertEqual(self.public()['profile'], {'name': server.DEFAULT_NAME, 'bio': server.DEFAULT_BIO, 'about': '', 'experience': server.DEFAULT_EXPERIENCE, 'students': [], 'avatar_url': '/avatar.png', 'background_url': None})
 
     def test_cover_visibility_follows_record_and_record_deletion_removes_image(self):
         self.login()
@@ -468,7 +567,7 @@ class DeploymentTemplate(unittest.TestCase):
             ('/api/posts-extra', None), ('/api/posts/name', None),
             ('/api/notes/12/cover', None), ('/api/posts/12/extra', None),
             ('/api/works', None), ('/api/bookmarks', None),
-            ('/api/profile', None), ('/api/avatar', None),
+            ('/api/profile', '1m'), ('/api/avatar', None),
         ):
             with self.subTest(path=path):
                 matches = [body for pattern, body in regex_locations if re.search(pattern, path)]
@@ -495,16 +594,17 @@ class Migration(unittest.TestCase):
                 ''')
             server.init()
             with server.connect() as connection:
-                self.assertEqual(server.profile_data(connection), {'name': server.DEFAULT_NAME, 'bio': server.DEFAULT_BIO, 'avatar_url': None, 'background_url': None})
+                self.assertEqual(server.profile_data(connection), {'name': server.DEFAULT_NAME, 'bio': server.DEFAULT_BIO, 'about': '', 'experience': server.DEFAULT_EXPERIENCE, 'students': [], 'avatar_url': None, 'background_url': None})
                 connection.execute('UPDATE profile SET name=?,bio=?,avatar=? WHERE id=1', ('edited', 'retained', png()))
             server.init()
             server.init()
             with server.connect() as connection:
                 self.assertEqual(tuple(connection.execute('SELECT * FROM account').fetchone()), (1, 'unchanged', 'salt', 'password'))
                 rows = [tuple(row) for row in connection.execute('SELECT * FROM records ORDER BY id')]
-                self.assertEqual(rows, [(4, 'services', '{"title":"existing service"}', 123), (5, 'notes', '{"title":"existing note"}', 124)])
-                self.assertEqual(server.profile_data(connection), {'name': 'edited', 'bio': 'retained', 'avatar_url': '/avatar.png', 'background_url': None})
+                self.assertEqual(rows, [(4, 'services', '{"title":"existing service"}', 123, None), (5, 'notes', '{"title":"existing note"}', 124, None)])
+                self.assertEqual(server.profile_data(connection), {'name': 'edited', 'bio': 'retained', 'about': '', 'experience': server.DEFAULT_EXPERIENCE, 'students': [], 'avatar_url': '/avatar.png', 'background_url': None})
                 self.assertEqual(connection.execute('SELECT avatar FROM profile').fetchone()['avatar'], png())
+                self.assertEqual(connection.execute('SELECT note_category_order FROM profile').fetchone()['note_category_order'], '[]')
 
 
 if __name__ == '__main__':

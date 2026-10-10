@@ -1,21 +1,29 @@
 """Single-user private workspace. Python 3.10+, standard library only."""
 from contextlib import contextmanager
-import argparse, base64, binascii, getpass, hashlib, hmac, io, json, os, re, secrets, sqlite3, struct, time, zipfile
+import argparse, base64, binascii, gzip, getpass, hashlib, hmac, io, json, math, os, re, secrets, sqlite3, struct, time, unicodedata, zipfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 from http.cookies import SimpleCookie
 from cover_search import search_covers, fetch_cover_image, CoverSourceError
+from public_page import render_public_page, render_rss
 
 ROOT = Path(__file__).parent
 DB = Path(os.environ.get('SITE_DB', ROOT / 'data/site.sqlite3'))
-CATEGORIES = ['动漫','漫画','游戏','小说','电影','电视剧','出版书籍']
-KINDS = ['posts','notes','friends','works','bookmarks']
+CATEGORIES = ['动画','漫画','游戏','小说','书籍','影视']
+STATUS_LABELS = {'动画':('在看','看过','想看'),'影视':('在看','看过','想看'),'漫画':('在读','读过','想读'),'小说':('在读','读过','想读'),'书籍':('在读','读过','想读'),'游戏':('在玩','玩过','想玩')}
+LEGACY_CATEGORY = {'动漫':'动画','电影':'影视','电视剧':'影视','出版书籍':'书籍'}
+ANIME_CATEGORIES = ('动画', '动漫')
+PROJECT_STATUSES = ['进行中','已完成','归档']
+KINDS = ['posts','notes','projects','friends','works','bookmarks']
 DEFAULT_NAME = 'RongGuang233'
 DEFAULT_BIO = '写下想法，记录生活中的喜欢。'
+DEFAULT_EXPERIENCE = '两年家教经历。'
+DEFAULT_NOTE_CATEGORY_ORDER = ('高中数学讲义', '普通物理')
 AVATAR_LIMIT = 1024 * 1024
 COVER_LIMIT = 2 * 1024 * 1024
-COVER_KINDS = ('posts','works')
+COVER_KINDS = ('posts','works','projects')
+WRITING_KINDS = ('posts','notes','projects')
 TEXT_REQUEST_LIMIT = 1024 * 1024
 RECORD_SELECT = """SELECT records.*,record_covers.record_id IS NOT NULL AS has_cover,friend_avatar.id AS friend_avatar_id
     FROM records LEFT JOIN record_covers ON record_covers.record_id=records.id
@@ -34,40 +42,141 @@ def connect():
 def init():
     DB.parent.mkdir(parents=True, exist_ok=True)
     with connect() as c:
-        c.executescript('''CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY CHECK(id=1), username TEXT, salt TEXT, password TEXT);
+        c.executescript('''CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, username TEXT UNIQUE, salt TEXT, password TEXT);
         CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, expires REAL);
         CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY, kind TEXT, data TEXT, updated REAL);
-        CREATE TABLE IF NOT EXISTS profile (id INTEGER PRIMARY KEY CHECK(id=1), name TEXT NOT NULL, bio TEXT NOT NULL, avatar BLOB);
+        CREATE TABLE IF NOT EXISTS profile (id INTEGER PRIMARY KEY CHECK(id=1), name TEXT NOT NULL, bio TEXT NOT NULL, avatar BLOB, about TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS record_covers (record_id INTEGER PRIMARY KEY, image BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS drafts (key TEXT PRIMARY KEY, kind TEXT NOT NULL, record_id INTEGER, data TEXT NOT NULL, cover_action TEXT NOT NULL DEFAULT 'keep', updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS media (id TEXT PRIMARY KEY, owner_type TEXT NOT NULL, owner_key TEXT NOT NULL, role TEXT NOT NULL, image BLOB NOT NULL);''')
+        # Rebuild the original single-account table (CHECK(id=1)) to allow extra editors.
+        schema=c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='account'").fetchone()
+        if schema and 'CHECK(id=1)' in (schema['sql'] or ''):
+            c.execute('ALTER TABLE account RENAME TO account_legacy')
+            c.execute('CREATE TABLE account (id INTEGER PRIMARY KEY, username TEXT UNIQUE, salt TEXT, password TEXT)')
+            c.execute('INSERT INTO account(id,username,salt,password) SELECT id,username,salt,password FROM account_legacy')
+            c.execute('DROP TABLE account_legacy')
+        profile_columns = {row['name'] for row in c.execute('PRAGMA table_info(profile)')}
+        if 'about' not in profile_columns:
+            c.execute("ALTER TABLE profile ADD COLUMN about TEXT NOT NULL DEFAULT ''")
+        if 'experience' not in profile_columns:
+            c.execute(f"ALTER TABLE profile ADD COLUMN experience TEXT NOT NULL DEFAULT '{DEFAULT_EXPERIENCE}'")
+        if 'students' not in profile_columns:
+            c.execute("ALTER TABLE profile ADD COLUMN students TEXT NOT NULL DEFAULT '[]'")
+        if 'note_category_order' not in profile_columns:
+            c.execute("ALTER TABLE profile ADD COLUMN note_category_order TEXT NOT NULL DEFAULT '[]'")
+        if 'hidden_work_categories' not in profile_columns:
+            c.execute("ALTER TABLE profile ADD COLUMN hidden_work_categories TEXT NOT NULL DEFAULT '[]'")
+        if 'published_at' not in {row['name'] for row in c.execute('PRAGMA table_info(records)')}:
+            c.execute('ALTER TABLE records ADD COLUMN published_at REAL')
         c.execute('INSERT OR IGNORE INTO profile(id,name,bio) VALUES (1,?,?)', (DEFAULT_NAME,DEFAULT_BIO))
+    # Bounded, reentrant batches also resume if startup was interrupted after ALTER.
+    # updated is the only available historical date; never rewrite source JSON.
+    after=0
+    while True:
+        with connect() as c:
+            rows=c.execute("SELECT id,data,updated FROM records WHERE id>? AND kind IN ('posts','notes','projects') AND published_at IS NULL ORDER BY id LIMIT 500",(after,)).fetchall()
+            for row in rows:
+                if json.loads(row['data']).get('published') is True:
+                    c.execute('UPDATE records SET published_at=? WHERE id=? AND published_at IS NULL',(row['updated'],row['id']))
+            if rows: after=rows[-1]['id']
+        if len(rows)<500: break
+    # Migrate legacy work categories and freeze display order via JSON update.
+    with connect() as c:
+        rows = [dict(id=row['id'], data=json.loads(row['data'])) for row in c.execute("SELECT id,data FROM records WHERE kind='works'").fetchall()]
+        missing = [item for item in rows if not isinstance(item['data'].get('legacy_order'), (int, float))]
+        missing.sort(key=lambda item: (-(item['data'].get('rating') if isinstance(item['data'].get('rating'), (int, float)) else -1), item['id']))
+        for rank, item in enumerate(missing):
+            item['data']['legacy_order'] = rank
+            c.execute('UPDATE records SET data=? WHERE id=?', (json.dumps(item['data'], ensure_ascii=False), item['id']))
+        for item in rows:
+            d = item['data']
+            changed = False
+            cat = LEGACY_CATEGORY.get(d.get('category',''), d.get('category',''))
+            if cat and cat != d.get('category') and cat in CATEGORIES:
+                d['category'] = cat
+                changed = True
+            labels = STATUS_LABELS.get(d.get('category','') or cat)
+            if labels:
+                doing, done, want = labels
+                p = str(d.get('progress') or '').strip()
+                mapped = None
+                if not p or p in ('想看','想读','想玩'):
+                    mapped = want
+                elif re.search(r'已看完|看完了|已通关|已读完|听完|已听过|已看过|读过|看过|玩过', p):
+                    mapped = done if p not in (done, doing, want) else p
+                    if p in (done,): mapped = p
+                elif p in (doing, done, want):
+                    mapped = p
+                elif p:
+                    mapped = doing if not re.search(r'已|过', p) else done
+                else:
+                    mapped = want
+                if mapped and mapped != d.get('progress'):
+                    d['progress'] = mapped
+                    changed = True
+            if changed:
+                c.execute('UPDATE records SET data=? WHERE id=?', (json.dumps(d, ensure_ascii=False), item['id']))
     os.chmod(DB, 0o600)
+
+def publication_input(data):
+    value=data.get('published_at')
+    if value is not None and (type(value) not in (int,float) or not math.isfinite(value) or not 0<=value<=253402300799):
+        raise ValueError('公开日期须为有效的 Unix 秒数或 null')
+    return value
+
+def publication_date(kind,data,previous=None):
+    if kind not in WRITING_KINDS: return None
+    value=publication_input(data)
+    if value is not None: return value
+    if previous is not None and previous['published_at'] is not None: return previous['published_at']
+    return time.time() if data.get('published') is True else None
 
 def digest(password, salt):
     return hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=16384, r=8, p=1).hex()
 
 def set_account(username, password):
     if not username.strip() or len(password) < 12: raise ValueError('用户名不能为空，密码至少 12 位')
-    salt = secrets.token_hex(16)
+    username=username.strip(); salt = secrets.token_hex(16)
     with connect() as c:
-        c.execute('INSERT OR REPLACE INTO account VALUES (1,?,?,?)', (username.strip(),salt,digest(password,salt)))
+        if c.execute('SELECT 1 FROM account WHERE id!=1 AND username=?',(username,)).fetchone():
+            raise ValueError('用户名已被其他账号使用')
+        c.execute('INSERT INTO account(id,username,salt,password) VALUES (1,?,?,?) '
+                  'ON CONFLICT(id) DO UPDATE SET username=excluded.username,salt=excluded.salt,password=excluded.password',
+                  (username,salt,digest(password,salt)))
         c.execute('DELETE FROM sessions')
 
+def add_account(username, password):
+    if not username.strip() or len(password) < 12: raise ValueError('用户名不能为空，密码至少 12 位')
+    username=username.strip(); salt = secrets.token_hex(16)
+    with connect() as c:
+        # id=1 belongs to the primary account; never let an added account claim it.
+        if c.execute('SELECT 1 FROM account WHERE id=1').fetchone() is None:
+            raise ValueError('请先运行 account 创建主账号')
+        if c.execute('SELECT 1 FROM account WHERE username=?',(username,)).fetchone():
+            raise ValueError('用户名已存在')
+        c.execute('INSERT INTO account(username,salt,password) VALUES (?,?,?)', (username,salt,digest(password,salt)))
+
 def validate(kind, data, previous=None, draft=False):
-    fields = {'posts':['title','body','summary','tags'], 'friends':['title','url','notes'], 'bookmarks':['title','url','tags','notes'], 'notes':['title','body'], 'works':['title','category','progress','rating','notes']}[kind]
+    # Notes accept optional tags as a backward-compatible JSON field. Existing
+    # rows without tags continue to validate and render exactly as before.
+    fields = {'posts':['title','body','summary','tags'], 'friends':['title','url','notes'], 'bookmarks':['title','url','tags','notes'], 'notes':['title','body','tags','category'], 'works':['title','category','progress','rating','notes'], 'projects':['title','body','summary','tags','status','repo_url','demo_url']}[kind]
     d = {k: data.get(k,'') for k in fields}
     for k,v in d.items():
         if k == 'rating': continue
         if not isinstance(v,str) or len(v)> (50000 if k=='body' else 4000): raise ValueError('字段过长或格式错误')
         d[k] = v if draft and k=='body' else v.strip()
     if not d['title'] and not draft: raise ValueError('请填写名称或标题')
-    for k in ['url']:
+    for k in ['url','repo_url','demo_url']:
         if k in d and d[k]:
             u=urlsplit(d[k])
             if u.scheme not in ('http','https') or not u.hostname or u.username or u.password: raise ValueError('请输入不包含账号密码的 HTTP(S) 地址')
     if kind in ('friends','bookmarks') and not d['url']: raise ValueError('请填写链接')
+    if kind=='projects':
+        if not d['status']: d['status']='进行中'
+        elif d['status'] not in PROJECT_STATUSES: raise ValueError('请选择项目状态')
     if kind=='works':
+        d['category'] = LEGACY_CATEGORY.get(d['category'], d['category'])
         if d['category'] not in CATEGORIES: raise ValueError('请选择作品分类')
         if d['rating'] in ('',None): d['rating']=None
         else:
@@ -76,19 +185,85 @@ def validate(kind, data, previous=None, draft=False):
     # A partial update must not silently publish or unpublish existing content.
     d['published'] = data.get('published',True if previous is None else previous.get('published') is True)
     if not isinstance(d['published'],bool): raise ValueError('公开状态必须为 true 或 false')
-    if kind=='posts':
-        for field in ('featured','pinned'):
+    if kind in ('posts','projects'):
+        for field in ('featured',) + (('pinned',) if kind=='posts' else ()):
             d[field]=data.get(field,(previous or {}).get(field,False))
             if not isinstance(d[field],bool): raise ValueError('精选和置顶状态必须为 true 或 false')
     if kind=='friends':
         d['order']=data.get('order',(previous or {}).get('order',0))
         if type(d['order']) is not int or not -1000000<=d['order']<=1000000: raise ValueError('友链排序须为 -1000000 到 1000000 的整数')
+    if kind=='notes':
+        d['order']=(previous or {}).get('order',0) if d['category']==(previous or {}).get('category','') else 0
     return d
 
 def profile_data(c):
-    row=c.execute('SELECT name,bio,avatar IS NOT NULL AS has_avatar FROM profile WHERE id=1').fetchone()
+    row=c.execute('SELECT name,bio,about,experience,students,avatar IS NOT NULL AS has_avatar FROM profile WHERE id=1').fetchone()
     background=c.execute("SELECT id FROM media WHERE owner_type='profile' AND owner_key='1' AND role='background'").fetchone()
-    return {'name':row['name'],'bio':row['bio'],'avatar_url':'/avatar.png' if row['has_avatar'] else None,'background_url':media_url(background['id']) if background else None}
+    return {'name':row['name'],'bio':row['bio'],'about':row['about'],'experience':row['experience'],'students':json.loads(row['students']),'avatar_url':'/avatar.png' if row['has_avatar'] else None,'background_url':media_url(background['id']) if background else None}
+
+def profile_students(students):
+    if not isinstance(students,list) or len(students)>60:
+        raise ValueError('学生风采须为列表，最多 60 条')
+    cleaned=[]
+    for student in students:
+        if not isinstance(student,dict): raise ValueError('每条学生风采须为对象')
+        surname=student.get('surname'); subjects=student.get('subjects',''); university=student.get('university')
+        if not isinstance(surname,str): raise ValueError('学生姓氏须为 1–2 个中文汉字，请勿填写全名')
+        surname=surname.strip()
+        if not 1<=len(surname)<=2 or any(not unicodedata.name(char,'').startswith('CJK UNIFIED IDEOGRAPH-') for char in surname):
+            raise ValueError('学生姓氏须为 1–2 个中文汉字，请勿填写全名')
+        if not isinstance(subjects,str) or len(subjects.strip())>80:
+            raise ValueError('辅导科目最多 80 个字符，可留空')
+        if not isinstance(university,str) or not 1<=len(university.strip())<=120:
+            raise ValueError('就读大学须为 1–120 个字符')
+        cleaned.append({'surname':surname,'subjects':subjects.strip(),'university':university.strip()})
+    return cleaned
+
+def note_categories(c):
+    categories=set()
+    for row in c.execute("SELECT data FROM records WHERE kind='notes'").fetchall():
+        value=json.loads(row['data']).get('category','')
+        if isinstance(value,str) and value.strip():
+            categories.add(value.strip())
+    return categories
+
+def note_category_order(c, available=None):
+    """Return the saved order followed by any categories added since the save."""
+    available=note_categories(c) if available is None else {
+        value.strip() for value in available if isinstance(value,str) and value.strip()
+    }
+    row=c.execute('SELECT note_category_order FROM profile WHERE id=1').fetchone()
+    try:
+        saved=json.loads(row['note_category_order'] or '[]') if row else []
+    except (TypeError, json.JSONDecodeError):
+        saved=[]
+    if not isinstance(saved,list): saved=[]
+    ordered=[]
+    for value in saved:
+        if isinstance(value,str) and value.strip() in available and value.strip() not in ordered:
+            ordered.append(value.strip())
+    remaining=available-set(ordered)
+    ordered.extend(value for value in DEFAULT_NOTE_CATEGORY_ORDER if value in remaining)
+    ordered.extend(sorted(remaining-set(ordered), key=lambda value:value.casefold()))
+    return ordered
+
+def save_note_category_order(c, categories):
+    available=note_categories(c)
+    if not isinstance(categories,list) or len(categories)>500:
+        raise ValueError('分类顺序列表无效')
+    cleaned=[]
+    for value in categories:
+        if not isinstance(value,str) or not value.strip() or len(value.strip())>4000:
+            raise ValueError('分类顺序列表无效')
+        value=value.strip()
+        if value in cleaned:
+            raise ValueError('分类顺序列表包含重复分类')
+        cleaned.append(value)
+    if set(cleaned)!=available:
+        raise ValueError('分类内容已变化，请关闭面板并刷新后重试')
+    c.execute('UPDATE profile SET note_category_order=? WHERE id=1',
+              (json.dumps(cleaned,ensure_ascii=False,separators=(',',':')),))
+    return cleaned
 
 def record_data(row):
     d=json.loads(row['data'])
@@ -97,8 +272,11 @@ def record_data(row):
         d['cover_url']=f"/covers/{row['id']}.jpg" if row['has_cover'] else None
     if row['kind']=='posts':
         d.update(featured=d.get('featured') is True,pinned=d.get('pinned') is True)
+    if row['kind']=='projects':
+        d.update(featured=d.get('featured') is True,status=d.get('status') or '进行中',repo_url=d.get('repo_url') or '',demo_url=d.get('demo_url') or '')
     if row['kind']=='friends':
         d.update(order=d.get('order',0),avatar_url=media_url(row['friend_avatar_id']) if row['friend_avatar_id'] else None)
+    if row['kind'] in WRITING_KINDS: d['published_at']=row['published_at']
     return dict(d,id=row['id'],updated=row['updated'],published=d.get('published') is True)
 
 def avatar_data(data):
@@ -113,17 +291,11 @@ def avatar_data(data):
     if not (1<=width<=1024 and 1<=height<=1024): raise ValueError('头像宽高须在 1–1024 像素内')
     return raw
 
-def cover_data(data):
-    image=data.get('image')
-    prefix='data:image/jpeg;base64,'
-    if not isinstance(image,str) or not image.startswith(prefix): raise ValueError('请上传 JPEG 格式的封面')
-    try: raw=base64.b64decode(image[len(prefix):],validate=True)
-    except (ValueError,binascii.Error): raise ValueError('封面图片编码无效') from None
-    if len(raw)>COVER_LIMIT: raise ValueError('封面不能超过 2 MiB')
+def jpeg_dimensions(raw):
     invalid='封面 JPEG 图片无效'
-    if not raw.startswith(b'\xff\xd8\xff') or not raw.endswith(b'\xff\xd9'): raise ValueError(invalid)
+    if not isinstance(raw,bytes) or not raw.startswith(b'\xff\xd8\xff') or not raw.endswith(b'\xff\xd9'): raise ValueError(invalid)
     # Check the frame and segment boundaries of the browser-generated JPEG.
-    offset=2; has_frame=False
+    offset=2; dimensions=None
     while offset<len(raw)-2:
         if raw[offset]!=0xff: raise ValueError(invalid)
         while offset<len(raw) and raw[offset]==0xff: offset+=1
@@ -137,11 +309,21 @@ def cover_data(data):
             if len(segment)<6: raise ValueError(invalid)
             height,width=struct.unpack('>HH',segment[1:5]); components=segment[5]
             if not height or not width or not components or len(segment)!=6+3*components: raise ValueError(invalid)
-            has_frame=True
+            dimensions=(width,height)
         elif marker==0xda:
-            if not has_frame or not segment or not segment[0] or len(segment)!=4+2*segment[0] or offset>=len(raw)-2: raise ValueError(invalid)
-            return raw
+            if dimensions is None or not segment or not segment[0] or len(segment)!=4+2*segment[0] or offset>=len(raw)-2: raise ValueError(invalid)
+            return dimensions
     raise ValueError(invalid)
+
+def cover_data(data):
+    image=data.get('image')
+    prefix='data:image/jpeg;base64,'
+    if not isinstance(image,str) or not image.startswith(prefix): raise ValueError('请上传 JPEG 格式的封面')
+    try: raw=base64.b64decode(image[len(prefix):],validate=True)
+    except (ValueError,binascii.Error): raise ValueError('封面图片编码无效') from None
+    if len(raw)>COVER_LIMIT: raise ValueError('封面不能超过 2 MiB')
+    jpeg_dimensions(raw)
+    return raw
 
 
 def media_url(ident):
@@ -149,6 +331,22 @@ def media_url(ident):
 
 def body_media(data):
     return set(re.findall(r'/media/([a-f0-9]{32})\.jpg',data.get('body','')))
+
+def public_note_image_sizes(c,notes):
+    references=sorted({(ident,str(note['id'])) for note in notes for ident in body_media(note)})
+    result={}
+    # Pair each referenced image with its public record owner; unrelated blobs
+    # are not read. Keep each batch below SQLite's older 999-parameter limit.
+    for offset in range(0,len(references),400):
+        batch=references[offset:offset+400]
+        placeholders=','.join(' (?,?)' for _ in batch)
+        values=[value for pair in batch for value in pair]
+        rows=c.execute("SELECT id,image FROM media WHERE owner_type='record' AND role='inline' AND (id,owner_key) IN (VALUES"+placeholders+")",values).fetchall()
+        for row in rows:
+            try: width,height=jpeg_dimensions(row['image'])
+            except ValueError: continue
+            result[row['id']]={'width':width,'height':height}
+    return result
 
 def draft_data(c,row):
     result=dict(json.loads(row['data']),key=row['key'],kind=row['kind'],record_id=row['record_id'],updated=row['updated'],cover_url=None)
@@ -164,14 +362,16 @@ def save_draft(c,key,data):
     old=c.execute('SELECT * FROM drafts WHERE key=?',(key,)).fetchone()
     kind=data.get('kind',old['kind'] if old else None)
     record_id=data.get('record_id',old['record_id'] if old else None)
-    if kind not in ('posts','notes'): raise ValueError('草稿仅支持博客和笔记')
+    if kind not in WRITING_KINDS: raise ValueError('草稿仅支持博客、笔记和项目')
     if record_id is not None and (type(record_id) is not int or record_id<1): raise ValueError('关联记录无效')
     if old and (kind!=old['kind'] or record_id!=old['record_id']): raise ValueError('草稿不能更换所属内容')
     record=c.execute('SELECT * FROM records WHERE id=? AND kind=?',(record_id,kind)).fetchone() if record_id is not None else None
     if record_id is not None and record is None: return None
     previous=json.loads(old['data']) if old else json.loads(record['data']) if record else None
+    if not old and record is not None: previous['published_at']=record['published_at']
     merged=dict(previous or {},**data)
     d=validate(kind,merged,previous,draft=True)
+    if 'published_at' in merged: d['published_at']=publication_input(merged)
     # Boolean editor flags are validated even if they do not apply to notes.
     for flag in ('featured','pinned'):
         if flag in data and not isinstance(data[flag],bool): raise ValueError('精选和置顶状态必须为 true 或 false')
@@ -203,12 +403,17 @@ def commit_draft(c,row):
     stored=json.loads(row['data'])
     d=validate(row['kind'],stored,previous=stored)
     ident=row['record_id']
+    previous=c.execute('SELECT * FROM records WHERE id=?',(ident,)).fetchone() if ident is not None else None
+    if row['kind']=='notes':
+        current=json.loads(previous['data']) if previous else {}
+        d['order']=current.get('order',0) if d['category']==current.get('category','') else 0
+    published_at=publication_date(row['kind'],dict(d,**({'published_at':stored['published_at']} if 'published_at' in stored else {})),previous)
     check_content_media(c,d,ident,row['key'])
     if ident is None:
-        ident=c.execute('INSERT INTO records(kind,data,updated) VALUES (?,?,?)',(row['kind'],json.dumps(d),time.time())).lastrowid
+        ident=c.execute('INSERT INTO records(kind,data,updated,published_at) VALUES (?,?,?,?)',(row['kind'],json.dumps(d),time.time(),published_at)).lastrowid
     else:
-        c.execute('UPDATE records SET data=?,updated=? WHERE id=?',(json.dumps(d),time.time(),ident))
-    if row['kind']=='posts' and row['cover_action']=='replace':
+        c.execute('UPDATE records SET data=?,updated=?,published_at=? WHERE id=?',(json.dumps(d),time.time(),published_at,ident))
+    if row['kind'] in ('posts','projects') and row['cover_action']=='replace':
         cover=c.execute("SELECT image FROM media WHERE owner_type='draft' AND owner_key=? AND role='cover'",(row['key'],)).fetchone()
         if not cover: raise ValueError('草稿封面不可用，请重新选择')
         c.execute('INSERT INTO record_covers(record_id,image) VALUES (?,?) ON CONFLICT(record_id) DO UPDATE SET image=excluded.image',(ident,cover['image']))
@@ -225,13 +430,21 @@ def delete_record(c,record_id):
     c.execute('DELETE FROM record_covers WHERE record_id=?',(record_id,))
     c.execute('DELETE FROM records WHERE id=?',(record_id,))
 
+def hidden_work_categories(c):
+    row=c.execute('SELECT hidden_work_categories FROM profile WHERE id=1').fetchone()
+    return json.loads(row['hidden_work_categories']) if row else []
+
+def record_is_public(c,kind,data,hidden=None):
+    if data.get('published') is not True: return False
+    return kind!='works' or LEGACY_CATEGORY.get(data.get('category'),data.get('category')) not in (hidden_work_categories(c) if hidden is None else hidden)
+
 def media_is_public(c,row):
     if row['owner_type']=='profile': return row['role']=='background'
     if row['owner_type'] not in ('record','friend'): return False
     record=c.execute('SELECT kind,data FROM records WHERE id=?',(row['owner_key'],)).fetchone()
     if not record: return False
     data=json.loads(record['data'])
-    if data.get('published') is not True: return False
+    if not record_is_public(c,record['kind'],data): return False
     if row['owner_type']=='friend': return record['kind']=='friends' and row['role']=='avatar'
     return row['id'] in body_media(data)
 
@@ -247,7 +460,7 @@ def upload_media(c,data):
     if owner_type=='draft':
         owner=c.execute('SELECT * FROM drafts WHERE key=?',(owner_key,)).fetchone()
         if not owner: return None
-        if role not in ('inline','cover') or (role=='cover' and owner['kind']!='posts'): raise ValueError('这类草稿不支持该图片用途')
+        if role not in ('inline','cover') or (role=='cover' and owner['kind'] not in ('posts','projects')): raise ValueError('这类草稿不支持该图片用途')
     elif owner_type=='friend':
         if not owner_key.isdigit() or not c.execute("SELECT 1 FROM records WHERE id=? AND kind='friends'",(owner_key,)).fetchone(): return None
         if role!='avatar': raise ValueError('友链图片仅支持头像')
@@ -279,7 +492,7 @@ def export_zip(c,kind=None,ident=None):
                 media=c.execute('SELECT image FROM media WHERE id=?',(media_id,)).fetchone()
                 if media: body=body.replace(media_url(media_id),image_file(media_id+'.jpg',media['image']))
             header=['---']
-            for key in ('title','kind','published','featured','pinned','order','tags','summary','category','progress','rating','url'):
+            for key in ('title','kind','published','published_at','featured','pinned','order','tags','summary','category','progress','rating','url'):
                 if key in data: header.append(key+': '+json.dumps(data[key],ensure_ascii=False))
             header.extend(['---','', '# '+data.get('title','').replace('\n',' ').strip() if data.get('title','').strip() else '# 未命名草稿',''])
             if cover: header.extend(['![封面]('+image_file(cover[0],cover[1])+')',''])
@@ -303,7 +516,15 @@ def export_zip(c,kind=None,ident=None):
                     if m: cover=(f"cover-{row['record_id']}.jpg",m['image'])
                 write_content('drafts',row['key'],data,cover)
             profile=profile_data(c)
-            archive.writestr('profile.md','# '+profile['name']+'\n\n'+profile['bio']+'\n')
+            profile_text='# '+profile['name']+'\n\n'+profile['bio']+'\n'+('\n'+profile['about']+'\n' if profile['about'] else '')
+            if profile['experience']:
+                profile_text+='\n## 经历\n\n'+profile['experience']+'\n'
+            if profile['students']:
+                profile_text+='\n## 部分学生风采\n\n'
+                for student in profile['students']:
+                    subjects=f"；辅导科目：{student['subjects']}" if student['subjects'] else ''
+                    profile_text+=f"- {student['surname']}\\*\\*{subjects}；就读大学：{student['university']}\n"
+            archive.writestr('profile.md',profile_text)
             avatar=c.execute('SELECT avatar FROM profile WHERE id=1').fetchone()['avatar']
             if avatar: archive.writestr('images/profile-avatar.png',avatar)
             background=c.execute("SELECT image FROM media WHERE owner_type='profile' AND owner_key='1' AND role='background'").fetchone()
@@ -314,12 +535,21 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass  # log sanitized route/status in send() instead
     def send(self, status, data, content_type='application/json; charset=utf-8', headers=None):
         body=json.dumps(data,ensure_ascii=False).encode() if content_type.startswith('application/json') else data
+        response_headers = dict(headers or {})
+        accepts_gzip = 'gzip' in self.headers.get('Accept-Encoding', '').lower()
+        compressible = content_type.startswith(('application/json', 'text/'))
+        if accepts_gzip and compressible and len(body) >= 512:
+            compressed = gzip.compress(body, compresslevel=6, mtime=0)
+            if len(compressed) < len(body):
+                body = compressed
+                response_headers['Content-Encoding'] = 'gzip'
+                response_headers['Vary'] = 'Accept-Encoding'
         route=urlsplit(self.path).path.split('/')[:3]
-        route='/'.join(part if part in ['', 'api', *KINDS, 'public', 'profile', 'avatar', 'avatar.png', 'covers', 'cover-search', 'image', 'login', 'logout', 'session', 'private', 'app.js', 'style.css', 'robots.txt'] else '?' for part in route)
+        route='/'.join(part if part in ['', 'api', *KINDS, 'public', 'profile', 'avatar', 'avatar.png', 'covers', 'cover-search', 'image', 'login', 'logout', 'session', 'private', 'app.js', 'theme-init.js', 'style.css', 'robots.txt'] else '?' for part in route)
         print(f'{self.command} {route} {status}',flush=True)
         self.send_response(status)
         # KaTeX's generated formula spans use style attributes for glyph placement.
-        for k,v in {'Content-Type':content_type,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Robots-Tag':'noindex, nofollow','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'", **(headers or {})}.items(): self.send_header(k,v)
+        for k,v in {'Content-Type':content_type,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Robots-Tag':'noindex, nofollow','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'", **response_headers}.items(): self.send_header(k,v)
         self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
     def auth(self):
         try:
@@ -340,6 +570,31 @@ class Handler(BaseHTTPRequestHandler):
     def route(self):
         path=urlsplit(self.path).path
         parts=path.strip('/').split('/')
+        if path=='/feed.xml' and self.command=='GET':
+            with connect() as c:
+                profile=profile_data(c)
+                records=[]
+                rows=c.execute("SELECT id,kind,data,published_at FROM records WHERE kind IN ('posts','notes','projects') ORDER BY published_at DESC,id DESC")
+                for row in rows:
+                    data=json.loads(row['data'])
+                    if data.get('published') is not True: continue
+                    records.append(dict(data,id=row['id'],kind=row['kind'],published_at=row['published_at']))
+                    if len(records)==50: break
+            origin=os.environ.get('SITE_ORIGIN') or 'http://'+self.headers.get('Host','')
+            return self.send(200,render_rss(records,profile,origin),'application/rss+xml; charset=utf-8')
+        if len(parts)==3 and parts[0]=='read' and parts[1] in ('posts','notes','works','projects') and parts[2].isdigit() and self.command=='GET':
+            with connect() as c:
+                row=c.execute(RECORD_SELECT+' WHERE records.kind=? AND records.id=?',(parts[1],int(parts[2]))).fetchone()
+                readable=row is not None and record_is_public(c,row['kind'],json.loads(row['data']))
+                if readable: record=record_data(row); profile=profile_data(c)
+            if not readable:
+                shell=(ROOT/'public/index.html').read_text()
+                content=f'<div class="layout public-layout"><section class="content"><div class="empty"><h2>内容不存在或尚未公开</h2><p><a href="/#{parts[1]}">返回列表</a></p></div></section></div>'
+                page=re.sub(r'(<main\b[^>]*>).*?(</main>)',lambda match:match[1]+content+match[2],shell,count=1,flags=re.S)
+                return self.send(404,page.encode(),'text/html; charset=utf-8')
+            origin=os.environ.get('SITE_ORIGIN') or 'http://'+self.headers.get('Host','')
+            page=render_public_page((ROOT/'public/index.html').read_text(),record,profile,origin,f'/read/{parts[1]}/{row["id"]}')
+            return self.send(200,page.encode(),'text/html; charset=utf-8')
         is_cover=len(parts)==4 and parts[0]=='api' and parts[1] in COVER_KINDS and parts[2].isdigit() and parts[3]=='cover'
         if self.command!='GET':
             expected=os.environ.get('SITE_ORIGIN', 'http://'+self.headers.get('Host',''))
@@ -347,11 +602,13 @@ class Handler(BaseHTTPRequestHandler):
             size=int(self.headers.get('Content-Length',0))
             limit=1536*1024 if path=='/api/avatar' and self.command=='POST' else 65536
             # Allow all valid text fields, including JSON-escaped Unicode, within one request.
-            if len(parts)>=2 and parts[0]=='api' and parts[1] in ('posts','notes'):
+            if len(parts)>=2 and parts[0]=='api' and parts[1] in WRITING_KINDS:
                 if (len(parts)==2 and self.command=='POST') or (len(parts)==3 and parts[2].isdigit() and self.command=='PUT'):
                     limit=TEXT_REQUEST_LIMIT
             if is_cover and self.command=='POST': limit=3*1024*1024
             if len(parts)==3 and parts[:2]==['api','drafts'] and self.command=='PUT': limit=TEXT_REQUEST_LIMIT
+            if path=='/api/notes/categories/order' and self.command=='POST': limit=TEXT_REQUEST_LIMIT
+            if path=='/api/profile' and self.command=='PUT': limit=TEXT_REQUEST_LIMIT
             if path=='/api/media' and self.command=='POST': limit=3*1024*1024
             if size<0: raise ValueError('内容长度无效')
             if size>limit: return self.send(413,{'error':'内容过长'})
@@ -360,12 +617,22 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/public' and self.command=='GET':
             with connect() as c:
                 result={'profile':profile_data(c),**{kind:[] for kind in KINDS}}
+                hidden=hidden_work_categories(c)
+                result['hidden_work_categories']=hidden
+                public_note_categories=set()
                 rows=c.execute(RECORD_SELECT+' ORDER BY records.updated DESC').fetchall()
                 for row in rows:
                     if row['kind'] in KINDS:
                         d=record_data(row)
-                        if d['published']: result[row['kind']].append(d)
-                result['posts'].sort(key=lambda row:(not row['pinned'],-row['updated']))
+                        if record_is_public(c,row['kind'],d,hidden):
+                            result[row['kind']].append(d)
+                            if row['kind']=='notes' and d.get('category','').strip():
+                                public_note_categories.add(d['category'].strip())
+                result['note_category_order']=note_category_order(c, public_note_categories)
+                result['note_image_sizes']=public_note_image_sizes(c,result['notes'])
+                result['posts'].sort(key=lambda row:(not row['pinned'],-(row['published_at'] or 0)))
+                result['notes'].sort(key=lambda row:-(row['published_at'] or 0))
+                result['projects'].sort(key=lambda row:(not row.get('featured'),-(row['published_at'] or 0)))
                 result['friends'].sort(key=lambda row:(row['order'],-row['updated']))
             return self.send(200,result)
         if len(parts)==2 and parts[0]=='media' and re.fullmatch(r'[a-f0-9]{32}\.jpg',parts[1]) and self.command=='GET':
@@ -377,8 +644,9 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts)==2 and parts[0]=='covers' and parts[1].endswith('.jpg') and parts[1][:-4].isdigit() and self.command=='GET':
             ident=int(parts[1][:-4])
             with connect() as c:
-                row=c.execute("SELECT records.data,record_covers.image FROM records JOIN record_covers ON record_covers.record_id=records.id WHERE records.id=? AND records.kind IN ('posts','works')",(ident,)).fetchone()
-            if row is None or (json.loads(row['data']).get('published') is not True and not self.auth()): return self.send(404,{'error':'未找到'})
+                row=c.execute("SELECT records.kind,records.data,record_covers.image FROM records JOIN record_covers ON record_covers.record_id=records.id WHERE records.id=? AND records.kind IN ('posts','works','projects')",(ident,)).fetchone()
+                public=row is not None and record_is_public(c,row['kind'],json.loads(row['data']))
+            if row is None or (not public and not self.auth()): return self.send(404,{'error':'未找到'})
             return self.send(200,row['image'],'image/jpeg')
         if path=='/avatar.png' and self.command=='GET':
             with connect() as c: avatar=c.execute('SELECT avatar FROM profile WHERE id=1').fetchone()['avatar']
@@ -386,8 +654,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200,avatar,'image/png')
         if path=='/api/login' and self.command=='POST':
             with connect() as c:
-                a=c.execute('SELECT * FROM account').fetchone()
-                valid=a and hmac.compare_digest(a['username'],str(data.get('username',''))) and hmac.compare_digest(a['password'],digest(str(data.get('password','')),a['salt']))
+                uname=str(data.get('username','')); pw=str(data.get('password',''))
+                accounts=c.execute('SELECT * FROM account').fetchall()
+                valid=any(hmac.compare_digest(str(a['username'] or ''),uname) and hmac.compare_digest(a['password'],digest(pw,a['salt'])) for a in accounts)
                 if not valid: return self.send(401,{'error':'用户名或密码错误'})
                 token=secrets.token_urlsafe(32); ttl=int(os.environ.get('SESSION_TTL','43200'))
                 c.execute('DELETE FROM sessions WHERE expires<=?',(time.time(),))
@@ -439,7 +708,7 @@ class Handler(BaseHTTPRequestHandler):
                 if row['owner_type']=='draft' and row['role']=='cover': c.execute("UPDATE drafts SET cover_action='remove',updated=? WHERE key=?",(time.time(),row['owner_key']))
                 c.execute('DELETE FROM media WHERE id=?',(row['id'],))
             return self.send(200,{'ok':True})
-        if self.command=='GET' and (path=='/api/export.zip' or (len(parts)==4 and parts[:2]==['api','export'] and parts[2] in ('posts','notes') and re.fullmatch(r'[0-9]+\.zip',parts[3]))):
+        if self.command=='GET' and (path=='/api/export.zip' or (len(parts)==4 and parts[:2]==['api','export'] and parts[2] in WRITING_KINDS and re.fullmatch(r'[0-9]+\.zip',parts[3]))):
             kind=parts[2] if len(parts)==4 else None; ident=int(parts[3][:-4]) if kind else None
             with connect() as c: archive=export_zip(c,kind,ident)
             if archive is None: return self.send(404,{'error':'记录不存在'})
@@ -450,9 +719,14 @@ class Handler(BaseHTTPRequestHandler):
                 if self.command=='PUT':
                     current=profile_data(c)
                     name=data.get('name',current['name']); bio=data.get('bio',current['bio'])
+                    about=data.get('about',current['about'])
+                    experience=data.get('experience',current['experience'])
                     if not isinstance(name,str) or not name.strip() or len(name)>80: raise ValueError('名称须为 1–80 个字符')
                     if not isinstance(bio,str) or len(bio)>1000: raise ValueError('简介最多 1000 个字符')
-                    c.execute('UPDATE profile SET name=?,bio=? WHERE id=1',(name.strip(),bio.strip()))
+                    if not isinstance(about,str) or len(about)>20000: raise ValueError('详细介绍须为文本，最多 20000 个字符')
+                    if not isinstance(experience,str) or len(experience)>5000: raise ValueError('经历须为文本，最多 5000 个字符')
+                    students=profile_students(data.get('students',current['students']))
+                    c.execute('UPDATE profile SET name=?,bio=?,about=?,experience=?,students=? WHERE id=1',(name.strip(),bio.strip(),about,experience,json.dumps(students,ensure_ascii=False,separators=(',',':'))))
                 result=profile_data(c)
             return self.send(200,result)
         if path=='/api/avatar' and self.command in ('POST','DELETE'):
@@ -465,6 +739,45 @@ class Handler(BaseHTTPRequestHandler):
             token=SimpleCookie(self.headers.get('Cookie',''))['session'].value
             with connect() as c: c.execute('DELETE FROM sessions WHERE token=?',(hashlib.sha256(token.encode()).hexdigest(),))
             return self.send(200,{'ok':True},headers={'Set-Cookie':'session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/'})
+        if path=='/api/works/categories/visibility' and self.command in ('GET','PUT'):
+            with connect() as c:
+                if self.command=='PUT':
+                    hidden=data.get('hidden_categories')
+                    if not isinstance(hidden,list) or any(not isinstance(name,str) or name not in CATEGORIES for name in hidden):
+                        raise ValueError('请选择有效的作品分类')
+                    c.execute('UPDATE profile SET hidden_work_categories=? WHERE id=1',(json.dumps([name for name in CATEGORIES if name in hidden],ensure_ascii=False),))
+                result=hidden_work_categories(c)
+            return self.send(200,{'hidden_categories':result})
+        if path=='/api/notes/categories/order' and self.command in ('GET','POST'):
+            with connect() as c:
+                if self.command=='GET':
+                    ordered=note_category_order(c)
+                else:
+                    ordered=save_note_category_order(c,data.get('categories'))
+            return self.send(200,{'categories':ordered})
+        if path=='/api/notes/reorder' and self.command=='POST':
+            category=data.get('category')
+            ids=data.get('ids')
+            if not isinstance(category,str) or len(category.strip())>120: raise ValueError('分类无效')
+            category=category.strip()
+            if not category: raise ValueError('请先选择一个分类')
+            if not isinstance(ids,list) or not ids or len(ids)>500 or any(type(ident) is not int or ident<1 for ident in ids):
+                raise ValueError('笔记顺序列表无效')
+            if len(set(ids)) != len(ids): raise ValueError('笔记顺序列表包含重复内容')
+            with connect() as c:
+                placeholders=','.join('?' for _ in ids)
+                rows=c.execute(f"SELECT id,data FROM records WHERE kind='notes' AND id IN ({placeholders})",ids).fetchall()
+                if len(rows)!=len(ids): raise ValueError('部分笔记不存在或已被删除')
+                category_ids={row['id'] for row in c.execute("SELECT id,data FROM records WHERE kind='notes'") if json.loads(row['data']).get('category','').strip()==category}
+                if set(ids)!=category_ids: raise ValueError('分类内容已变化，请关闭面板并刷新后重试')
+                by_id={row['id']:row for row in rows}
+                for ident in ids:
+                    record=json.loads(by_id[ident]['data'])
+                    if str(record.get('category','')).strip()!=category: raise ValueError('只能调整同一分类内的笔记')
+                for position,ident in enumerate(ids,1):
+                    record=json.loads(by_id[ident]['data']); record['order']=position
+                    c.execute('UPDATE records SET data=? WHERE id=?',(json.dumps(record),ident))
+            return self.send(200,{'ok':True,'category':category,'count':len(ids)})
         if len(parts)>=2 and parts[0]=='api' and parts[1] in KINDS:
             kind=parts[1]
             response=None
@@ -476,8 +789,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200,result)
                 if len(parts)==2 and self.command=='POST':
                     d=validate(kind,data)
-                    if kind in ('posts','notes'): check_content_media(c,d)
-                    cur=c.execute('INSERT INTO records(kind,data,updated) VALUES (?,?,?)',(kind,json.dumps(d),time.time()))
+                    if kind in WRITING_KINDS: check_content_media(c,d)
+                    published_at=publication_date(kind,dict(d,**({'published_at':data['published_at']} if 'published_at' in data else {})))
+                    cur=c.execute('INSERT INTO records(kind,data,updated,published_at) VALUES (?,?,?,?)',(kind,json.dumps(d),time.time(),published_at))
                     response=(201,{'id':cur.lastrowid})
                 if len(parts)>=3 and parts[2].isdigit():
                     ident=int(parts[2]); row=c.execute('SELECT * FROM records WHERE kind=? AND id=?',(kind,ident)).fetchone()
@@ -492,28 +806,33 @@ class Handler(BaseHTTPRequestHandler):
                             response=(200,{'cover_url':None})
                     if len(parts)==3 and self.command=='PUT':
                         d=validate(kind,data,json.loads(row['data']))
-                        if kind in ('posts','notes'): check_content_media(c,d,ident)
-                        c.execute('UPDATE records SET data=?,updated=? WHERE id=?',(json.dumps(d),time.time(),ident))
-                        if kind in ('posts','notes'): cleanup_record_media(c,ident)
+                        if kind in WRITING_KINDS: check_content_media(c,d,ident)
+                        published_at=publication_date(kind,dict(d,**({'published_at':data['published_at']} if 'published_at' in data else {})),row)
+                        c.execute('UPDATE records SET data=?,updated=?,published_at=? WHERE id=?',(json.dumps(d),time.time(),published_at,ident))
+                        if kind in WRITING_KINDS: cleanup_record_media(c,ident)
                         response=(200,{'ok':True})
                     if len(parts)==3 and self.command=='DELETE':
                         delete_record(c,ident); response=(200,{'ok':True})
             if response is not None: return self.send(*response)
         if self.command=='GET':
-            files={'/':'index.html','/private':'index.html','/app.js':'app.js','/style.css':'style.css','/robots.txt':'robots.txt','/cover.jpg':'cover.jpg'}
-            files.update({f'/{name}':name for name in ('image-editor.js','image-editor.css','writing-editor.js','markdown.js','marked.umd.js','marked-katex.umd.js')})
+            files={'/':'index.html','/private':'index.html','/app.js':'app.js','/style.css':'style.css','/robots.txt':'robots.txt','/cover.jpg':'cover.jpg','/favicon.svg':'favicon.svg'}
+            files.update({f'/{name}':name for name in ('portal.css','theme-init.js','work-browser.js','reading-navigation.js','reading-navigation.css','image-editor.js','image-editor.css','writing-editor.js','markdown.js','marked.umd.js','marked-katex.umd.js')})
             files.update({'/'+f.relative_to(ROOT/'public').as_posix():f.relative_to(ROOT/'public').as_posix() for f in (ROOT/'public/katex').rglob('*') if f.is_file() and f.suffix in ('.js','.css','.woff2','.woff','.ttf')})
+            files.update({'/university-seals/'+f.name:'university-seals/'+f.name for f in (ROOT/'public/university-seals').glob('*') if f.is_file() and f.suffix in ('.png','.jpg','.svg')})
             if path in files:
-                f=ROOT/'public'/files[path]; mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.txt':'text/plain','.jpg':'image/jpeg','.woff2':'font/woff2','.woff':'font/woff','.ttf':'font/ttf'}[f.suffix]
+                f=ROOT/'public'/files[path]; mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.txt':'text/plain','.jpg':'image/jpeg','.png':'image/png','.svg':'image/svg+xml','.woff2':'font/woff2','.woff':'font/woff','.ttf':'font/ttf'}[f.suffix]
                 return self.send(200,f.read_bytes(),mime)
         self.send(404,{'error':'未找到'})
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(); parser.add_argument('action',choices=['serve','account'],nargs='?',default='serve'); parser.add_argument('--port',type=int,default=3080); args=parser.parse_args(); init()
-    if args.action=='account':
+    parser=argparse.ArgumentParser(); parser.add_argument('action',choices=['serve','account','add-account'],nargs='?',default='serve'); parser.add_argument('--port',type=int,default=3080); args=parser.parse_args(); init()
+    if args.action in ('account','add-account'):
         username=input('用户名: '); password=getpass.getpass('密码（至少12位，不显示）: ')
         if password!=getpass.getpass('再次输入密码: '): raise SystemExit('密码不一致')
-        set_account(username,password); print('唯一账号已设置，旧会话已退出。')
+        if args.action=='account':
+            set_account(username,password); print('主账号已设置，旧会话已退出。')
+        else:
+            add_account(username,password); print('账号已添加，已有会话保持有效。')
     else:
         print(f'Local preview: http://127.0.0.1:{args.port}',flush=True)
         ThreadingHTTPServer(('127.0.0.1',args.port),Handler).serve_forever()

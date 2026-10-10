@@ -4,9 +4,10 @@ import gzip, hashlib, io, tarfile, py_compile, uuid
 root=Path(__file__).resolve().parents[1]
 py_compile.compile(str(root/'server.py'),doraise=True)
 py_compile.compile(str(root/'cover_search.py'),doraise=True)
+py_compile.compile(str(root/'public_page.py'),doraise=True)
 out=root/'dist';out.mkdir(exist_ok=True)
 py_compile.compile(str(root/'backup.py'),doraise=True)
-files=[root/'server.py',root/'cover_search.py',root/'backup.py',root/'README.md',root/'package.json',root/'package-lock.json']
+files=[root/'server.py',root/'cover_search.py',root/'public_page.py',root/'backup.py',root/'README.md',root/'package.json',root/'package-lock.json']
 for directory in ['public','deploy']:files.extend(p for p in (root/directory).rglob('*') if p.is_file())
 buffer=io.BytesIO()
 with tarfile.open(fileobj=buffer,mode='w',format=tarfile.USTAR_FORMAT) as archive:

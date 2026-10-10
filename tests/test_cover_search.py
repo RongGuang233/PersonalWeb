@@ -43,15 +43,33 @@ class SearchTests(unittest.TestCase):
                     covers.search_covers(query, category)
             request.assert_not_called()
 
-    def test_movie_tv_episode_filter_and_anime_keeps_both_formats(self):
+    def test_movie_tv_episode_filter_keeps_episode_format(self):
         data = [movie('1', '流浪地球'), movie('2', '庆余年 第一季', '46')]
-        for category, expected in [('电影', ['1']), ('电视剧', ['2']), ('动漫', ['1', '2'])]:
+        for category, expected in [('电影', ['1']), ('电视剧', ['2'])]:
             with self.subTest(category=category), patch.object(covers, '_json_request', return_value=data) as request:
                 result = covers.search_covers('作品', category)
                 self.assertEqual([r['source_url'].split('/')[-2] for r in result['results']], expected)
                 self.assertIn('movie.douban.com/j/subject_suggest?', request.call_args.args[0])
         with patch.object(covers, '_json_request', return_value=[movie('2', '庆余年', '46')]):
             self.assertIn('46 集', covers.search_covers('庆余年', '电视剧')['results'][0]['subtitle'])
+
+    def test_anime_uses_bangumi_and_upgrades_image_scheme(self):
+        BANGUMI_IMAGE = 'https://lain.bgm.tv/pic/cover/l/13/c5/400602_ZI8Y9.jpg'
+        data = {'results': 1, 'list': [{
+            'id': 400602, 'type': 2, 'name': '葬送のフリーレン', 'name_cn': '葬送的芙莉莲',
+            'air_date': '2023-09-29',
+            'images': {'large': BANGUMI_IMAGE.replace('https://', 'http://')},
+        }]}
+        with patch.object(covers, '_json_request', return_value=data) as request:
+            result = covers.search_covers('葬送的芙莉莲', '动画')
+        item = result['results'][0]
+        self.assertEqual(item['source'], 'Bangumi')
+        self.assertEqual(item['title'], '葬送的芙莉莲')
+        self.assertEqual(item['image_url'], BANGUMI_IMAGE)
+        self.assertEqual(item['source_url'], 'https://bgm.tv/subject/400602/')
+        self.assertIn('葬送のフリーレン', item['subtitle'])
+        self.assertIn('api.bgm.tv/search/subject/', request.call_args.args[0])
+        self.assertIn('动画候选', result['message'])
 
     def test_book_categories_use_large_cover_and_disclose_subtype_limits(self):
         data = [{'title': '遮天1·九龙拉棺', 'id': '11502594', 'pic': BOOK_IMAGE,
@@ -138,7 +156,10 @@ class ImageTests(unittest.TestCase):
                 IMAGE_URL + '?url=http://localhost', IMAGE_URL.replace('.com/', '.com:8443/'),
                 'https://img3.doubanio.com/../private', STEAM_IMAGE + '&redirect=http://localhost',
                 'https://shared.akamai.steamstatic.com/private/header.jpg',
-                'https://lain.bgm.tv/pic/cover/l/25/7a/test.jpg', '\n' + IMAGE_URL, None]
+                'https://lain.bgm.tv/pic/cover/l/25/7a/test.jpg',
+                'https://lain.bgm.tv/private/cover.jpg',
+                'https://lain.bgm.tv/pic/cover/l/25/7a/400602_ZI8Y9.jpg?x=1',
+                '\n' + IMAGE_URL, None]
         with patch.object(urllib.request, 'build_opener') as build:
             for url in urls:
                 with self.subTest(url=url), self.assertRaises(ValueError):
@@ -147,7 +168,9 @@ class ImageTests(unittest.TestCase):
 
     def test_referer_matches_douban_image_source_and_keeps_custom_user_agent(self):
         for url, referer in [(IMAGE_URL, 'https://movie.douban.com/'),
-                             (BOOK_IMAGE, 'https://book.douban.com/'), (STEAM_HEADER, None)]:
+                             (BOOK_IMAGE, 'https://book.douban.com/'),
+                             (STEAM_HEADER, None),
+                             ('https://lain.bgm.tv/pic/cover/l/13/c5/400602_ZI8Y9.jpg', 'https://bgm.tv/')]:
             with self.subTest(url=url), patch.object(urllib.request, 'build_opener') as build:
                 build.return_value.open.return_value = Response(b'\xff\xd8\xffdata', url=url)
                 covers.fetch_cover_image(url)

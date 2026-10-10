@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import unittest
@@ -5,6 +6,21 @@ import zipfile
 
 import test_server as baseline
 import server
+
+# A real 7x3 JPEG makes width/height swaps visible without an image dependency.
+LANDSCAPE_JPEG = base64.b64decode(
+    '/9j/4AAQSkZJRgABAQAASABIAAD/4QBMRXhpZgAATU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKAC'
+    'AAQAAAABAAAAB6ADAAQAAAABAAAAAwAAAAD/7QA4UGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAAA4QklNBCUAAAAAABDUHYzZ'
+    'jwCyBOmACZjs+EJ+/8AAEQgAAwAHAwEiAAIRAQMRAf/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIB'
+    'AwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNE'
+    'RUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfI'
+    'ycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIB'
+    'AgQEAwQHBQQEAAECdwABAgMRBAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpD'
+    'REVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG'
+    'x8jJytLT1NXW19jZ2uLj5OXm5+jp6vLz9PX29/j5+v/bAEMAAgICAgICAwICAwUDAwMFBgUFBQUGCAYGBgYGCAoICAgICAgK'
+    'CgoKCgoKCgwMDAwMDA4ODg4ODw8PDw8PDw8PD//bAEMBAgICBAQEBwQEBxALCQsQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ'
+    'EBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEP/dAAQAAf/aAAwDAQACEQMRAD8A/n/ooooA/9k='
+)
 
 
 class ContentFeatures(unittest.TestCase):
@@ -18,9 +34,10 @@ class ContentFeatures(unittest.TestCase):
     public = baseline.Integration.public
     record = baseline.Integration.record
 
-    def test_math_browser_assets_are_self_hosted_and_formula_styles_are_allowed(self):
+    def test_browser_assets_are_self_hosted_and_formula_styles_are_allowed(self):
         for path, mime in [('/katex/katex.min.js', 'text/javascript'), ('/marked-katex.umd.js', 'text/javascript'),
-                           ('/katex/katex.min.css', 'text/css'), ('/katex/fonts/KaTeX_Main-Regular.woff2', 'font/woff2')]:
+                           ('/katex/katex.min.css', 'text/css'), ('/katex/fonts/KaTeX_Main-Regular.woff2', 'font/woff2'),
+                           ('/reading-navigation.js', 'text/javascript'), ('/reading-navigation.css', 'text/css')]:
             status, body, headers = self.req(path, client=self.anonymous)
             self.assertEqual(status, 200, path)
             self.assertTrue(headers['Content-Type'].startswith(mime))
@@ -89,6 +106,53 @@ class ContentFeatures(unittest.TestCase):
         self.assertFalse(updated['published'])
         self.commit('private-note')
         self.assertEqual([r['id'] for r in self.public()['notes']],[ident])
+
+    def test_public_note_image_sizes_include_only_committed_published_note_images(self):
+        self.assertEqual(self.public()['note_image_sizes'], {})
+        self.login()
+        self.draft('public-note', kind='notes', title='公开图片笔记', published=True)
+        first = self.upload('draft', 'public-note')
+        second = self.upload('draft', 'public-note', raw=LANDSCAPE_JPEG)
+        self.draft('public-note', body=f"![第一幅]({first['url']})\n\n![第二幅]({second['url']})")
+        self.commit('public-note')
+        excluded = []
+        for key, kind, published, commit in [('private-note', 'notes', False, True),
+                                              ('unfinished-note', 'notes', True, False),
+                                              ('public-post', 'posts', True, True),
+                                              ('public-project', 'projects', True, True)]:
+            self.draft(key, kind=kind, title=key, published=published)
+            image = self.upload('draft', key)
+            self.draft(key, body=f"![图片]({image['url']})")
+            if commit:
+                self.commit(key)
+            excluded.append(image['id'])
+        sizes = self.public()['note_image_sizes']
+        self.assertEqual(sizes, {first['id']: {'width': 2, 'height': 2}, second['id']: {'width': 7, 'height': 3}})
+        self.assertTrue(all(ident not in sizes for ident in excluded))
+
+    def test_public_note_image_sizes_batch_owned_references_and_skip_invalid_legacy_images(self):
+        self.login()
+        ident, data = self.record('notes', title='旧笔记', published=True)
+        other, _ = self.record('notes', title='其他公开笔记', published=True)
+        valid, invalid, orphan, foreign, wrong_role = [f'{index:032x}' for index in range(1, 6)]
+        data['body'] = '\n\n'.join(f'![图片]({server.media_url(image)})' for image in (valid, invalid, foreign, wrong_role))
+        with server.connect() as connection:
+            connection.executemany('INSERT INTO media VALUES (?,?,?,?,?)', [
+                (valid, 'record', str(ident), 'inline', baseline.jpeg()),
+                (invalid, 'record', str(ident), 'inline', b'legacy invalid jpeg'),
+                (orphan, 'record', str(ident), 'inline', baseline.jpeg()),
+                (foreign, 'record', str(other), 'inline', baseline.jpeg()),
+                (wrong_role, 'record', str(ident), 'cover', baseline.jpeg()),
+            ])
+            connection.execute('UPDATE records SET data=? WHERE id=?', (json.dumps(data), ident))
+        self.assertEqual(self.public()['note_image_sizes'], {valid: {'width': 2, 'height': 2}})
+        with server.connect() as connection:
+            queries = []
+            connection.set_trace_callback(queries.append)
+            sizes = server.public_note_image_sizes(connection, [{'id': ident, **data}])
+        self.assertEqual(sizes, {valid: {'width': 2, 'height': 2}})
+        reads = [query for query in queries if query.lstrip().upper().startswith('SELECT')]
+        self.assertEqual(len(reads), 1, 'body image references must be fetched together rather than once per image')
 
     def test_published_edit_keeps_original_content_and_cover_until_commit(self):
         self.login()
@@ -242,6 +306,26 @@ class ContentFeatures(unittest.TestCase):
             self.assertIn('profile.md', archive.namelist())
         self.assertEqual(self.req('/api/export/posts/9999.zip')[0], 404)
         self.assertEqual(self.req('/api/export.zip', client=self.anonymous)[0], 401)
+
+
+class JpegDimensions(unittest.TestCase):
+    def test_real_jpeg_dimensions_and_cover_bytes_are_preserved(self):
+        for raw, dimensions in ((baseline.jpeg(), (2, 2)), (baseline.jpeg(b'image comment'), (2, 2)), (LANDSCAPE_JPEG, (7, 3))):
+            self.assertEqual(server.jpeg_dimensions(raw), dimensions)
+            self.assertEqual(server.cover_data(baseline.cover_payload(raw)), raw)
+
+    def test_invalid_jpeg_frames_and_segments_keep_cover_validation(self):
+        original = baseline.jpeg()
+        frame = original.index(b'\xff\xc0')
+        zero_dimensions = original[:frame + 5] + b'\x00\x00\x00\x00' + original[frame + 9:]
+        for raw in (b'not a jpeg', b'\xff\xd8\xff\xd9', original[:-2],
+                    b'\xff\xd8\xff\xe0\xff\xff\x00\xff\xd9',
+                    original[:original.index(b'\xff\xda')] + b'\xff\xd9', zero_dimensions):
+            with self.subTest(raw=raw[:20]):
+                with self.assertRaisesRegex(ValueError, '封面 JPEG 图片无效'):
+                    server.jpeg_dimensions(raw)
+                with self.assertRaisesRegex(ValueError, '封面 JPEG 图片无效'):
+                    server.cover_data(baseline.cover_payload(raw))
 
 
 if __name__ == '__main__':

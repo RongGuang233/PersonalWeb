@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory(prefix='personal-site-acceptance-') as temp:
         cover_payload={'image':'data:image/jpeg;base64,'+base64.b64encode(cover_bytes).decode()}
         for kind in server.KINDS:
             ensure(request('/api/'+kind)[1]==[],'initial empty kind')
-            record={'published':False,'title':'acceptance-only','url':origin,'category':'动漫','rating':None,'body':'# temporary note'}
+            record={'published':False,'title':'acceptance-only','url':origin,'category':'动画','rating':None,'body':'# temporary note'}
             status,created=request('/api/'+kind,'POST',record);ensure(status==201,'create '+kind)
             ident=created['id'];record['title']='edited-only'
             if kind in ('posts','notes'):record['body']='中😀'*25000
