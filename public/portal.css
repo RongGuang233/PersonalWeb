@@ -625,7 +625,7 @@ body:is([data-page=public],[data-page=private]) .site-header { view-transition-n
 .public-layout .work-meta .star-rating { margin-left: auto; }
 .work-cover.cover-placeholder { background: linear-gradient(165deg, color-mix(in srgb, var(--portal-clock) 88%, var(--portal-gold)) 0%, color-mix(in srgb, var(--portal-clock) 70%, var(--portal-panel)) 100%); }
 .project-card .project-cover.cover-placeholder { background: linear-gradient(145deg, color-mix(in srgb, var(--portal-clock) 85%, var(--portal-gold)), color-mix(in srgb, var(--portal-panel) 80%, var(--portal-blue))); }
-.project-card .project-cover.cover-placeholder .cover-title { writing-mode: vertical-rl; text-orientation: upright; letter-spacing: 0.2em; max-height: 110px; margin: 0; font-family: 'Avenir Next', 'Songti SC', serif; }
+.project-card .project-cover.cover-placeholder .cover-title { writing-mode: horizontal-tb; text-orientation: mixed; letter-spacing: .02em; max-height: none; max-width: 100%; margin: 0; font-family: 'Avenir Next', 'Songti SC', serif; }
 .search-recent { gap: 6px 14px; margin-top: 10px; }
 .search-recent a { font-size: 13px; }
 .category-modules { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; min-width: 0; border: 0; margin: 0; padding: 0; }

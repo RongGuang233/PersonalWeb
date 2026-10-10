@@ -393,6 +393,19 @@ test('legacy management paths normalize without leaking into the public share UR
  assert.equal(f.scope.publicArticleURL('posts',1),'http://local/read/posts/1');
 });
 
+test('project detail links keep their canonical route when opened directly, clicked and reloaded',async()=>{
+ const direct=navigationFixture('http://local/read/projects/913');
+ assert.equal(direct.scope.routeFromLocation(),'read/projects/913');
+ assert.equal(direct.scope.normalizeRouteLocation(),'http://local/read/projects/913');
+ const f=navigationFixture('http://local/#projects');
+ await f.click('#read/projects/913');
+ assert.equal(f.scope.location.pathname,'/read/projects/913');
+ assert.equal(f.scope.routeFromLocation(),'read/projects/913');
+ assert.equal(f.scope.history.state.from,'projects');
+ await f.scope.init();
+ assert.equal(f.scope.location.href,'http://local/read/projects/913');
+});
+
 test('short notes with multiple sections get navigation while short posts keep their original threshold',()=>{
  const f=navigationFixture('http://local/read/notes/25');
  installReaderFixture(f);

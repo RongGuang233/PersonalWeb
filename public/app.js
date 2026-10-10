@@ -1619,13 +1619,13 @@ function syncPublicSession() {
 }
 function routeFromLocation() {
   if (location.hash) return location.hash.slice(1);
-  if (/^\/read\/(posts|notes|works)\/[1-9][0-9]*$/.test(location.pathname)) return location.pathname.slice(1);
+  if (/^\/read\/(posts|notes|works|projects)\/[1-9][0-9]*$/.test(location.pathname)) return location.pathname.slice(1);
   return location.pathname === '/private' ? 'private/posts' : 'home';
 }
 function publicArticleURL(kind,id) { return new URL(`/read/${kind}/${id}`,location.origin).href; }
 function normalizeRouteLocation() {
   const route = routeFromLocation();
-  const path = /^read\/(posts|notes|works)\/[1-9][0-9]*$/.test(route) ? '/' + route : '/#' + route;
+  const path = /^read\/(posts|notes|works|projects)\/[1-9][0-9]*$/.test(route) ? '/' + route : '/#' + route;
   if (location.pathname + location.search + location.hash !== path) history.replaceState(history.state,'',path);
   return location.href;
 }
