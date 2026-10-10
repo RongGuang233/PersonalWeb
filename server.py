@@ -81,9 +81,11 @@ def init():
                     c.execute('UPDATE records SET published_at=? WHERE id=? AND published_at IS NULL',(row['updated'],row['id']))
             if rows: after=rows[-1]['id']
         if len(rows)<500: break
-    # Migrate legacy work categories and freeze display order via JSON update.
+    # Only legacy categories need normalization. Current records may contain
+    # owner-written progress text and must remain unchanged on every restart.
     with connect() as c:
         rows = [dict(id=row['id'], data=json.loads(row['data'])) for row in c.execute("SELECT id,data FROM records WHERE kind='works'").fetchall()]
+        rows = [item for item in rows if item['data'].get('category') in LEGACY_CATEGORY]
         missing = [item for item in rows if not isinstance(item['data'].get('legacy_order'), (int, float))]
         missing.sort(key=lambda item: (-(item['data'].get('rating') if isinstance(item['data'].get('rating'), (int, float)) else -1), item['id']))
         for rank, item in enumerate(missing):

@@ -37,21 +37,22 @@ class Response(io.BytesIO):
 class SearchTests(unittest.TestCase):
     def test_query_validation_does_not_contact_source(self):
         with patch.object(covers, '_json_request') as request:
-            for query, category in [('', '电影'), ('  ', '电影'), ('x' * 121, '电影'),
-                                    (None, '电影'), ('x', 'movie'), ('x', None)]:
+            for query, category in [('', '影视'), ('  ', '影视'), ('x' * 121, '影视'),
+                                    (None, '影视'), ('x', 'movie'), ('x', None),
+                                    ('x', '电影'), ('x', '电视剧'), ('x', '出版书籍')]:
                 with self.subTest(query=query, category=category), self.assertRaises(ValueError):
                     covers.search_covers(query, category)
             request.assert_not_called()
 
-    def test_movie_tv_episode_filter_keeps_episode_format(self):
+    def test_film_category_keeps_movies_and_series_with_episode_format(self):
         data = [movie('1', '流浪地球'), movie('2', '庆余年 第一季', '46')]
-        for category, expected in [('电影', ['1']), ('电视剧', ['2'])]:
-            with self.subTest(category=category), patch.object(covers, '_json_request', return_value=data) as request:
-                result = covers.search_covers('作品', category)
-                self.assertEqual([r['source_url'].split('/')[-2] for r in result['results']], expected)
-                self.assertIn('movie.douban.com/j/subject_suggest?', request.call_args.args[0])
-        with patch.object(covers, '_json_request', return_value=[movie('2', '庆余年', '46')]):
-            self.assertIn('46 集', covers.search_covers('庆余年', '电视剧')['results'][0]['subtitle'])
+        with patch.object(covers, '_json_request', return_value=data) as request:
+            result = covers.search_covers('作品', '影视')
+        self.assertEqual([r['source_url'].split('/')[-2] for r in result['results']], ['1', '2'])
+        self.assertTrue(all(r['source'] == '豆瓣电影' for r in result['results']))
+        self.assertEqual(result['results'][0]['subtitle'], '影视 · 2019')
+        self.assertIn('46 集', result['results'][1]['subtitle'])
+        request.assert_called_once_with('https://movie.douban.com/j/subject_suggest?q=%E4%BD%9C%E5%93%81')
 
     def test_anime_uses_bangumi_and_upgrades_image_scheme(self):
         BANGUMI_IMAGE = 'https://lain.bgm.tv/pic/cover/l/13/c5/400602_ZI8Y9.jpg'
@@ -74,7 +75,7 @@ class SearchTests(unittest.TestCase):
     def test_book_categories_use_large_cover_and_disclose_subtype_limits(self):
         data = [{'title': '遮天1·九龙拉棺', 'id': '11502594', 'pic': BOOK_IMAGE,
                  'author_name': '辰东', 'year': '2012', 'type': 'b'}]
-        for category in ('漫画', '小说', '出版书籍'):
+        for category in ('漫画', '小说', '书籍'):
             with self.subTest(category=category), patch.object(covers, '_json_request', return_value=data) as request:
                 result = covers.search_covers(' 遮天 ', category)
                 item = result['results'][0]
@@ -82,7 +83,7 @@ class SearchTests(unittest.TestCase):
                 self.assertEqual(item['image_url'], BOOK_IMAGE.replace('/s/', '/l/'))
                 self.assertIn('辰东', item['subtitle'])
                 self.assertEqual('图书候选：请核对作者和版本。', result['message'])
-                self.assertIn('book.douban.com/j/subject_suggest?', request.call_args.args[0])
+                request.assert_called_once_with('https://book.douban.com/j/subject_suggest?q=%E9%81%AE%E5%A4%A9')
 
     def test_steam_uses_real_header_for_first_match_only(self):
         data = {'items': [game(), game(2, '黑神话：悟空 豪华升级包'), game(3, '无关游戏')]}
@@ -109,7 +110,7 @@ class SearchTests(unittest.TestCase):
             failure = covers.search_covers('原神', '游戏')
             self.assertEqual(request.call_count, 1)
         with patch.object(covers, '_json_request', return_value={'error': 'schema changed'}):
-            malformed = covers.search_covers('电影', '电影')
+            malformed = covers.search_covers('电影', '影视')
         self.assertIn('未收录', empty['message'])
         self.assertIn('暂时无法访问', failure['message'])
         self.assertIn('暂时无法访问', malformed['message'])
@@ -119,13 +120,13 @@ class SearchTests(unittest.TestCase):
         invalid['img'] = 'https://example.org/cover.jpg'
         data = [movie('1'), movie('1'), invalid, None, {'id': []}] + [movie(str(i)) for i in range(2, 15)]
         with patch.object(covers, '_json_request', return_value=data):
-            result = covers.search_covers('流浪地球', '电影')
+            result = covers.search_covers('流浪地球', '影视')
         self.assertEqual(len(result['results']), 8)
         self.assertEqual(len({x['source_url'] for x in result['results']}), 8)
 
     def test_exact_title_excludes_noise_but_alias_match_remains(self):
         with patch.object(covers, '_json_request', return_value=[movie('1'), movie('2', '无关电影')]):
-            self.assertEqual(len(covers.search_covers('流浪地球', '电影')['results']), 1)
+            self.assertEqual(len(covers.search_covers('流浪地球', '影视')['results']), 1)
         data = [{'id': '1', 'type': 'b', 'title': '海贼王 第0卷', 'pic': BOOK_IMAGE},
                 {'id': '2', 'type': 'b', 'title': '航海王', 'pic': BOOK_IMAGE}]
         with patch.object(covers, '_json_request', return_value=data):

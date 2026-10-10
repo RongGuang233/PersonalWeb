@@ -13,8 +13,7 @@ import urllib.parse
 import urllib.request
 
 
-CATEGORIES = ('动画', '漫画', '游戏', '小说', '电影', '电视剧', '出版书籍')
-ANIME_CATEGORIES = ('动画', '动漫')
+CATEGORIES = ('动画', '漫画', '游戏', '小说', '书籍', '影视')
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 TIMEOUT = 12
 USER_AGENT = 'personal-website-cover-search/1.0'
@@ -118,7 +117,7 @@ def _narrow_titles(query, results):
 
 
 def _douban(query, category):
-    books = category in ('漫画', '小说', '出版书籍')
+    books = category in ('漫画', '小说', '书籍')
     host = 'book.douban.com' if books else 'movie.douban.com'
     data = _json_request(f'https://{host}/j/subject_suggest?' + urllib.parse.urlencode({'q': query}))
     if not isinstance(data, list):
@@ -134,10 +133,6 @@ def _douban(query, category):
         # This public suggestion endpoint exposes episodes, not a movie/tv enum.
         # An absent field remains unknown instead of being labelled a film.
         has_episodes = isinstance(episode, str) and episode.isdigit() and int(episode) > 0
-        if not books and category == '电视剧' and episode == '':
-            continue
-        if not books and category == '电影' and has_episodes:
-            continue
         image_url = item.get('pic' if books else 'img')
         try:
             _validate_image_url(image_url)
@@ -240,12 +235,12 @@ def search_covers(query, category):
     try:
         if category == '游戏':
             candidates = _steam(query)
-        elif category in ANIME_CATEGORIES:
+        elif category == '动画':
             candidates = _bangumi(query)
         else:
             candidates = _douban(query, category)
     except CoverSourceError:
-        if category in ANIME_CATEGORIES:
+        if category == '动画':
             try:
                 candidates = _douban(query, category)
             except CoverSourceError:
@@ -265,9 +260,9 @@ def search_covers(query, category):
     message = '请核对名称、年份和版本后点选。'
     if results and results[0]['source'] == '豆瓣读书':
         message = '图书候选：请核对作者和版本。'
-    elif results and category in ANIME_CATEGORIES and results[0]['source'] == 'Bangumi':
+    elif results and category == '动画' and results[0]['source'] == 'Bangumi':
         message = '动画候选：请核对季度与版本。'
-    elif results and category in ANIME_CATEGORIES and results[0]['source'] == '豆瓣电影':
+    elif results and category == '动画' and results[0]['source'] == '豆瓣电影':
         message = '影视候选：请确认选择动画版。'
     return {'results': results[:8], 'message': message}
 

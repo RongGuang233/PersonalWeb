@@ -73,9 +73,11 @@ with tempfile.TemporaryDirectory(prefix='personal-site-acceptance-') as temp:
         ensure(request('/api/drafts/anonymous','PUT',{'kind':'notes'},auth=False)[0]==401,'draft write boundary')
         ensure(request('/api/media','POST',{},auth=False)[0]==401,'media write boundary')
         status,public=request('/api/public',auth=False)
-        ensure(status==200 and set(public)=={'profile',*server.KINDS},'public response')
+        ensure(status==200 and set(public)=={'profile',*server.KINDS,'hidden_work_categories','note_category_order','note_image_sizes'},'public response')
         ensure(all(public[kind]==[] for kind in server.KINDS),'empty public content')
-        ensure(public['profile']=={'name':server.DEFAULT_NAME,'bio':server.DEFAULT_BIO,'avatar_url':None,'background_url':None},'default profile')
+        default_profile={'name':server.DEFAULT_NAME,'bio':server.DEFAULT_BIO,'about':'','experience':server.DEFAULT_EXPERIENCE,'students':[],'avatar_url':None,'background_url':None}
+        ensure(public['profile']==default_profile,'default profile')
+        ensure(public['hidden_work_categories']==[] and public['note_category_order']==[] and public['note_image_sizes']=={},'default public display settings')
         ensure(request('/cover.jpg',auth=False)[0]==200,'cover image')
         ensure(request('/avatar.png',auth=False)[0]==404,'no initial avatar')
         ensure(request('/data/site.sqlite3',auth=False)[0]==404,'database static boundary')
@@ -88,35 +90,53 @@ with tempfile.TemporaryDirectory(prefix='personal-site-acceptance-') as temp:
             record={'published':False,'title':'acceptance-only','url':origin,'category':'动画','rating':None,'body':'# temporary note'}
             status,created=request('/api/'+kind,'POST',record);ensure(status==201,'create '+kind)
             ident=created['id'];record['title']='edited-only'
-            if kind in ('posts','notes'):record['body']='中😀'*25000
+            if kind in server.WRITING_KINDS:record['body']='中😀'*25000
             ensure(request(f'/api/{kind}/{ident}','PUT',record)[0]==200,'edit '+kind)
             saved=request('/api/'+kind)[1][0]
             ensure(saved['title']=='edited-only' and saved['published'] is False,'read private '+kind)
-            if kind in ('posts','notes'):ensure(saved['body']==record['body'],'50000 character text preserved '+kind)
+            if kind in server.WRITING_KINDS:ensure(saved['body']==record['body'],'50000 character text preserved '+kind)
             ensure(request('/api/public',auth=False)[1][kind]==[],'private content excluded '+kind)
-            if kind in ('posts','works'):
+            if kind=='projects':ensure(request(f'/read/projects/{ident}',auth=False)[0]==404,'private project detail excluded')
+            if kind in server.COVER_KINDS:
                 ensure(request(f'/api/{kind}/{ident}/cover','POST',cover_payload)[0]==200,'upload private cover '+kind)
                 ensure(request(f'/covers/{ident}.jpg',auth=False)[0]==404,'private cover boundary '+kind)
                 ensure(request(f'/covers/{ident}.jpg')[1]==cover_bytes,'private owner cover '+kind)
             record['published']=True
             ensure(request(f'/api/{kind}/{ident}','PUT',record)[0]==200,'publish '+kind)
             ensure([row['id'] for row in request('/api/public',auth=False)[1][kind]]==[ident],'public content '+kind)
-            if kind in ('posts','works'):
+            if kind in server.COVER_KINDS:
                 ensure(request(f'/covers/{ident}.jpg',auth=False)[1]==cover_bytes,'public cover '+kind)
+            if kind=='projects':
+                status,page=request(f'/read/projects/{ident}',auth=False)
+                ensure(status==200 and b'<title>edited-only' in page and f'<link rel="canonical" href="{origin}/read/projects/{ident}">'.encode() in page,'public project detail and canonical URL')
+            if kind=='works':
+                before=request('/api/works')[1]
+                visibility='/api/works/categories/visibility'
+                ensure(request(visibility,'PUT',{'hidden_categories':['动画']})[0]==200,'hide work category')
+                hidden_public=request('/api/public',auth=False)[1]
+                ensure(hidden_public['hidden_work_categories']==['动画'] and hidden_public['works']==[],'hidden work category excluded publicly')
+                ensure(request(f'/read/works/{ident}',auth=False)[0]==404 and request(f'/covers/{ident}.jpg',auth=False)[0]==404,'hidden category hides detail and cover')
+                ensure(request('/api/works')[1]==before and request(f'/covers/{ident}.jpg')[1]==cover_bytes,'hidden category preserves owner record and cover')
+                ensure(request(visibility,'PUT',{'hidden_categories':[]})[0]==200,'restore work category')
+                restored_public=request('/api/public',auth=False)[1]
+                ensure(restored_public['hidden_work_categories']==[] and [row['id'] for row in restored_public['works']]==[ident],'restored category publicly visible')
+                ensure(request(f'/read/works/{ident}',auth=False)[0]==200 and request(f'/covers/{ident}.jpg',auth=False)[1]==cover_bytes,'restored category detail and cover')
+                ensure(request('/api/works')[1]==before,'category restore preserves owner record')
             del record['published']
             ensure(request(f'/api/{kind}/{ident}','PUT',record)[0]==200,'edit published '+kind)
             ensure(request('/api/public',auth=False)[1][kind][0]['published'] is True,'retain publish state '+kind)
             record['published']=False
             ensure(request(f'/api/{kind}/{ident}','PUT',record)[0]==200,'unpublish '+kind)
             ensure(request('/api/public',auth=False)[1][kind]==[],'unpublished content excluded '+kind)
-            if kind in ('posts','works'):
+            if kind=='projects':ensure(request(f'/read/projects/{ident}',auth=False)[0]==404,'unpublished project detail excluded')
+            if kind in server.COVER_KINDS:
                 ensure(request(f'/covers/{ident}.jpg',auth=False)[0]==404,'unpublished cover boundary '+kind)
             ensure(request(f'/api/{kind}/{ident}','DELETE',{})[0]==200,'delete '+kind)
-            if kind in ('posts','works'):
+            if kind in server.COVER_KINDS:
                 ensure(request(f'/covers/{ident}.jpg')[0]==404,'cover removed with record '+kind)
             ensure(request('/api/'+kind)[1]==[],'empty after delete')
         for category in server.CATEGORIES:
-            ensure(request('/api/works','POST',{'title':'temporary '+category,'category':category,'rating':None,'published':False})[0]==201,'seven categories')
+            ensure(request('/api/works','POST',{'title':'temporary '+category,'category':category,'rating':None,'published':False})[0]==201,'work category '+category)
         ensure(request('/api/works','POST',{'title':'bad','category':'电影','rating':11})[0]==400,'rating bounds')
         ensure(request('/api/services')[0]==404,'removed services API')
         profile={'name':'Acceptance only','bio':'Temporary profile'}
@@ -180,9 +200,9 @@ with tempfile.TemporaryDirectory(prefix='personal-site-acceptance-') as temp:
         stop();start()
         ensure(request(f'/covers/{cover_id}.jpg')[1]==cover_bytes,'cover survives restart')
         ensure(request('/api/session')[0]==200,'session survives process restart')
-        works=request('/api/works')[1];ensure(len(works)==7 and all(r['rating'] is None and r['published'] is False for r in works),'records survive process restart')
+        works=request('/api/works')[1];ensure(len(works)==len(server.CATEGORIES) and all(r['rating'] is None and r['published'] is False for r in works),'records survive process restart')
         ensure(request('/api/public',auth=False)[1]['works']==[],'private content after restart')
-        ensure(request('/api/profile')[1]==dict(profile,avatar_url='/avatar.png',background_url=background_url),'profile survives restart')
+        ensure(request('/api/profile')[1]==dict(default_profile,**profile,avatar_url='/avatar.png',background_url=background_url),'profile survives restart')
         ensure(request('/avatar.png',auth=False)[1]==base64.b64decode(avatar.split(',',1)[1]),'avatar survives restart')
         ensure(request(background_url,auth=False)[1]==changed_cover,'profile background survives restart')
         ensure(request('/api/drafts/'+note_key)[1]['body']==note_body,'empty-title draft survives restart')
@@ -229,7 +249,7 @@ with tempfile.TemporaryDirectory(prefix='personal-site-acceptance-') as temp:
         ensure(request('/api/session')[0]==401,'logout invalidation');login()
         with server.connect() as connection:connection.execute('UPDATE sessions SET expires=?',(time.time()-1,))
         ensure(request('/api/session')[0]==401,'expired session')
-        print('PASS actual Python '+sys.version.split()[0]+': login/logout/expiry, five CRUD, 50000 character text, public/private content, seven categories/unrated, drafts/inline media/cover isolation and commit, readable Chinese Markdown+image ZIP exports, featured/pinned, friend order/avatar, profile background, process restart persistence')
+        print('PASS actual Python '+sys.version.split()[0]+f': login/logout/expiry, {len(server.KINDS)} CRUD, 50000 character text, public/private content, {len(server.CATEGORIES)} categories/unrated, project detail/canonical URL, work category hide/restore, drafts/inline media/cover isolation and commit, readable Chinese Markdown+image ZIP exports, featured/pinned, friend order/avatar, profile background, process restart persistence')
     finally:
         stop()
 print('PASS disposable database and account removed; formal database untouched')

@@ -398,6 +398,20 @@ class Integration(unittest.TestCase):
         self.assertEqual(tuple(actual[1]), ('services', old_service, 101))
         self.assertEqual(self.req('/api/services')[0], 404)
 
+    def test_restart_preserves_current_work_json_and_only_migrates_legacy_categories(self):
+        original=json.dumps({'title':'已有作品','category':'动画','progress':'看到第 3 集','rating':8,'published':True},ensure_ascii=False)
+        with server.connect() as connection:
+            current=connection.execute('INSERT INTO records(kind,data,updated) VALUES (?,?,?)',('works',original,123)).lastrowid
+            legacy=connection.execute('INSERT INTO records(kind,data,updated) VALUES (?,?,?)',('works',json.dumps({'title':'旧分类','category':'电影','progress':'看完了','rating':7,'published':True}),124)).lastrowid
+        server.init()
+        server.init()
+        with server.connect() as connection:
+            row=connection.execute('SELECT data,updated FROM records WHERE id=?',(current,)).fetchone()
+            migrated=json.loads(connection.execute('SELECT data FROM records WHERE id=?',(legacy,)).fetchone()['data'])
+        self.assertEqual(tuple(row),(original,123))
+        self.assertEqual(migrated['category'],'影视')
+        self.assertEqual(migrated['progress'],'看过')
+
     def test_profile_avatar_replace_delete_and_restart(self):
         self.assertEqual(self.req('/avatar.png', client=self.anonymous)[0], 404)
         self.login()
